@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# KARGU-OSINT · local Tor client for --tor scans.
+#   kargu-tor start | stop | status
+# Private torrc: Fedora's /etc/tor/torrc wants a control socket in /run/tor that a normal user cannot create.
+set -u
+# Resolve the tree through the ~/.local/bin symlink so the folder can be moved.
+OSINT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+DIR="$OSINT/.tor"
+RC="$DIR/torrc"
+LOG="$DIR/tor.log"
+PORT="${OSINT_TOR_PORT:-9050}"
+
+case "${1:-status}" in
+  start)
+    if ss -ltn 2>/dev/null | grep -q "127.0.0.1:$PORT"; then
+      echo "Tor is already listening on 127.0.0.1:$PORT"; exit 0
+    fi
+    mkdir -p "$DIR/data"; chmod 700 "$DIR" "$DIR/data"
+    printf 'SocksPort %s\nDataDirectory %s/data\nLog notice file %s\n' "$PORT" "$DIR" "$LOG" > "$RC"
+    setsid tor -f "$RC" >/dev/null 2>&1 &
+    printf "starting Tor"
+    for _ in $(seq 1 60); do
+      grep -q "Bootstrapped 100%" "$LOG" 2>/dev/null && break
+      printf "."; sleep 1
+    done
+    echo
+    if grep -q "Bootstrapped 100%" "$LOG" 2>/dev/null; then
+      echo "Tor ready on 127.0.0.1:$PORT — now you can run:  kargu <profile.txt> --tor"
+    else
+      echo "Tor did not finish bootstrapping; see $LOG" >&2; exit 1
+    fi ;;
+  stop)
+    pkill -f "tor -f $RC" && echo "Tor stopped." || echo "no Tor process of ours was running" ;;
+  status)
+    if ss -ltn 2>/dev/null | grep -q "127.0.0.1:$PORT"; then
+      echo "Tor is listening on 127.0.0.1:$PORT"
+      tail -1 "$LOG" 2>/dev/null
+    else
+      echo "Tor is not running. Start it with:  kargu-tor start"
+    fi ;;
+  *) echo "usage: kargu-tor {start|stop|status}" >&2; exit 2 ;;
+esac

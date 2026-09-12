@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Resolved relative to this wrapper so the tree can be moved.
+OSINT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+exec "$OSINT/tools/exiftool-master/exiftool" "$@"

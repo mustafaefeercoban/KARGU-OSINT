@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# SpiderFoot via the official Docker image (does not run natively on Python 3.14).
+# Entrypoint is overridden: the image's ENTRYPOINT is python itself, so "$@" would be parsed as python flags.
+# --network host: Mullvad's DNS-leak protection drops DNS from the bridge network.
+if ! docker image inspect smicallef/spiderfoot >/dev/null 2>&1; then
+  echo "SpiderFoot Docker image is missing. Install it with:  docker pull smicallef/spiderfoot" >&2
+  exit 127
+fi
+exec docker run --rm --network host --entrypoint /opt/venv/bin/python \
+  smicallef/spiderfoot /home/spiderfoot/sf.py "$@"

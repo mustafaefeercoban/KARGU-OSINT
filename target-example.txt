@@ -1,0 +1,45 @@
+# ==================================================
+#  TARGET PROFILE  —  write down what you KNOW about this person
+#  Rule: one "key: value" per line.
+#  The same key may be repeated on several lines.
+#  If you don't know a value, delete the line or leave it empty (empty values are skipped).
+#  Lines starting with '#' are notes/comments and are not processed.
+# ==================================================
+
+name:
+username:
+username:
+email:
+phone:
+domain:
+file:
+
+# "file:" takes a local path (photo/pdf) for the metadata stage. Do not put a comment on
+# the same line as a value — the parser reads everything after the colon as the value.
+notes:
+
+# --- EXAMPLE (delete freely) ---
+# name: John Doe
+# username: johndoe
+# username: jdoe_92
+# email: john.doe@example.com
+# domain: example.com
+# file: /home/user/Pictures/photo.jpg
+
+# ==================================================
+#  Usage:
+#     kargu  this-file.txt
+#  Through Tor:        kargu file.txt --tor      (first: kargu-tor start)
+#  SpiderFoot deep:    kargu file.txt --deep     (needs the Docker image)
+#
+#  When the script runs it:
+#    - runs the tools in logical order (identity -> e-mail -> social ->
+#      verification -> instagram -> domain -> correlation -> phone -> metadata)
+#    - writes/updates the "AUTO-FINDINGS" block at the end of this file
+#      (it does NOT append a second block; it replaces the previous one, and
+#      anything you write below the END marker is kept)
+#    - leaves a readable .html REPORT in the same folder
+#
+#  Note: run by hand, the report lands NEXT TO this .txt. Started through the
+#  wizard (kargu-new), every case goes under cases/<case>_<date>/ instead.
+# ==================================================

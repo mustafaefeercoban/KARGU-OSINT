@@ -1,0 +1,8 @@
+# Direct dependencies of osint_run.py / osint_ui.py / osint_wizard.py, pinned to /usr/bin/python3.
+# External OSINT tools live in pipx/ and tools/ and are invoked as subprocesses, not listed here.
+# The launchers use the system interpreter, not a venv; a venv from this file is for development only.
+
+flask==3.1.3
+requests==2.33.1
+Pillow==12.3.0
+PySocks==1.7.1

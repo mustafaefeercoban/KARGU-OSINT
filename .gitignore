@@ -1,0 +1,28 @@
+# secrets — keep the files locally, never push them
+config/.env
+config/h8mail_config.ini
+*.key
+*.pem
+
+# investigation data & results (personal data — never push)
+cases/
+notes/
+
+# installed tooling / third-party source / caches
+tools/
+pipx/
+.bootstrap/
+__pycache__/
+*.pyc
+*.bak-*
+*.bak
+.backups/
+
+# bin/ holds pipx symlinks and binaries; keep only the hand-written wrappers
+bin/*
+!bin/theHarvester
+!bin/exiftool
+!bin/sf
+
+# tor working directory
+.tor/

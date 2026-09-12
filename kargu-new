@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# KARGU-OSINT interactive intake wizard — usage: kargu-new [--name case] [--no-run]
+# Resolve the tree through the ~/.local/bin symlink so the folder can be moved.
+OSINT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+export PATH="$OSINT/bin:$PATH"
+# Pin the interpreter: the pipx-only .bootstrap/bin venv on PATH lacks flask/requests/Pillow.
+PY="${OSINT_PYTHON:-/usr/bin/python3}"
+[ -x "$PY" ] || PY="$(command -v python3)"
+exec "$PY" "$OSINT/osint_wizard.py" "$@"
