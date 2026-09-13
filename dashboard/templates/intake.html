@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>KARGU · new scan</title>
+<link rel="stylesheet" href="/static/dash.css">
+<style>
+.container{max-width:980px;margin:28px auto 80px;padding:0 20px}
+.hero h2{margin:0 0 6px;font-size:22px;color:#fff}
+.hero p{margin:0 0 24px;color:var(--mut)}
+.form-layout{display:grid;grid-template-columns:1.15fr .85fr;gap:22px}
+@media (max-width:860px){.form-layout{grid-template-columns:1fr}}
+.box{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:22px;margin-bottom:22px}
+.box h3{margin:0 0 12px;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--acc);display:flex;justify-content:space-between;align-items:center}
+.box h3 .tag{text-transform:none;letter-spacing:0}
+.drop{border:2px dashed var(--line);border-radius:10px;padding:24px 16px;text-align:center;position:relative;cursor:pointer;background:rgba(21,29,42,.45)}
+.drop:hover,.drop.over{border-color:var(--acc);background:rgba(240,160,60,.12)}
+.drop input[type=file]{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer}
+.drop .big{font-size:32px;display:block;margin-bottom:6px}
+.drop .hint{color:var(--mut);font-size:12px}
+.photos{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:12px;margin-top:14px}
+.photo{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px;position:relative}
+.photo img{width:100%;aspect-ratio:1;object-fit:cover;border-radius:6px;display:block;background:#000}
+.photo .nm{font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:6px}
+.photo .rm{position:absolute;top:4px;right:4px;width:22px;height:22px;border-radius:50%;border:1px solid var(--line);background:rgba(15,26,36,.9);color:var(--bad);cursor:pointer;padding:0;line-height:20px}
+.fg{margin-bottom:14px}
+.fg label{display:block;font-weight:600;font-size:13px;margin-bottom:3px}
+.fg .h{font-size:11.5px;color:var(--mut);margin-bottom:6px}
+.fc{width:100%;padding:9px 12px;background:var(--bg);border:1px solid var(--line);border-radius:8px;color:#fff;font-size:13.5px;font-family:inherit}
+.fc:focus{outline:none;border-color:var(--acc)}
+.fc.mono{font-family:ui-monospace,Menlo,monospace}
+.opts{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.opt{display:flex;align-items:center;gap:8px;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:8px 12px;font-size:13px;cursor:pointer}
+.opt input{accent-color:var(--acc);width:16px;height:16px}
+.opt.wide{grid-column:1/-1}
+.start{width:100%;background:linear-gradient(135deg,#f0a03c,#e08256);color:#0f1a24;border:0;border-radius:10px;padding:14px 20px;font-size:15px;font-weight:700;cursor:pointer;margin-top:14px}
+.start:disabled{opacity:.5;cursor:not-allowed}
+.list a{font-weight:600}
+.modal{display:none;position:fixed;inset:0;background:rgba(5,8,12,.88);z-index:99;align-items:center;justify-content:center}
+.modal.on{display:flex}
+.modal .win{background:var(--panel);border:1px solid var(--line);border-radius:14px;width:92%;max-width:720px;overflow:hidden}
+.modal .hd{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;gap:12px;align-items:center;font-weight:600}
+.pulse{width:12px;height:12px;border-radius:50%;background:var(--acc);animation:pulse 1.4s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(240,160,60,.7)}70%{box-shadow:0 0 0 10px rgba(240,160,60,0)}100%{box-shadow:0 0 0 0 rgba(240,160,60,0)}}
+.term{background:#080c10;border-top:1px solid var(--line);padding:12px 14px;font-family:ui-monospace,Menlo,monospace;font-size:12px;line-height:1.45;color:#94a3b8;height:300px;overflow-y:auto;white-space:pre-wrap;word-break:break-all}
+.modal .ft{padding:12px 20px;border-top:1px solid var(--line);font-size:12.5px;color:var(--mut);display:flex;justify-content:space-between;gap:12px}
+.modal .ft a{color:var(--acc)}
+</style>
+</head>
+<body>
+
+<header>
+  <h1><span>KARGU</span> Fusion</h1>
+  <span class="mut">new scan</span>
+  <span class="sp"></span>
+  <a href="/">← cases</a>
+</header>
+
+<main class="container">
+  <div class="hero">
+    <h2>Target profile &amp; reference photos</h2>
+    <p>Fill in what you know; every field can stay empty. Runs locally, only against targets you are authorised to investigate. When the scan ends you land on the case dashboard.</p>
+  </div>
+
+  <form id="intake" enctype="multipart/form-data">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <div class="form-layout">
+      <div>
+        <div class="box">
+          <h3>Reference photos <span class="tag info" id="photoCount">0 selected</span></h3>
+          <p class="mut" style="font-size:12px;margin:0 0 14px">Clear pictures of the person, ideally several angles. They are hashed against every profile picture the scan captures; with the local vision stack they are also face-matched (<code>--faces</code>) and compared with CLIP (<code>--clip</code>). Nothing is uploaded anywhere.</p>
+          <div class="drop" id="drop">
+            <input type="file" id="photoInput" name="photos" accept="image/jpeg,image/png,image/webp,image/gif,image/bmp" multiple>
+            <span class="big">📷</span>
+            <div>Drop photos here or click to choose</div>
+            <div class="hint">JPEG, PNG, WebP, GIF, BMP · up to 8 files, 15 MB each</div>
+          </div>
+          <div class="photos" id="photos"></div>
+          <div class="fg" style="margin-top:14px">
+            <label for="image">Reference photo URLs or paths</label>
+            <div class="h">Comma separated. Pictures on the web are fetched over the scan's own exit route.</div>
+            <input class="fc mono" type="text" id="image" name="image" placeholder="https://example.com/photo.jpg, /home/me/Pictures/target.png">
+          </div>
+        </div>
+
+        <div class="box">
+          <h3>Scan options</h3>
+          <div class="opts">
+            <label class="opt"><input type="checkbox" name="derive" checked> derive usernames</label>
+            <label class="opt"><input type="checkbox" name="api" checked> API sources</label>
+            <label class="opt"><input type="checkbox" name="deep"> SpiderFoot deep scan</label>
+            <label class="opt"><input type="checkbox" name="tor"> route via Tor</label>
+            {% if ml %}
+            <label class="opt wide"><input type="checkbox" name="faces"> local face matching (InsightFace) — biometric processing, needs a lawful basis</label>
+            <label class="opt wide"><input type="checkbox" name="clip"> CLIP visual similarity for reference photos</label>
+            {% else %}
+            <div class="opt wide mut">Face matching / CLIP are off: run <code>dashboard/install-ml.sh</code></div>
+            {% endif %}
+          </div>
+          <button type="submit" class="start" id="startBtn">Start scan</button>
+        </div>
+      </div>
+
+      <div>
+        <div class="box">
+          <h3>Identity</h3>
+          <div class="fg">
+            <label for="case">Case name</label>
+            <div class="h">Names the folder and files; empty picks the name or first handle.</div>
+            <input class="fc mono" type="text" id="case" name="case" placeholder="auto">
+          </div>
+          {% for f in fields %}
+          <div class="fg">
+            <label for="{{ f.key }}">{{ f.title }}{% if f.multi %} <span class="mut">(comma separated)</span>{% endif %}</label>
+            <div class="h">{{ f.hint }} · e.g. {{ f.example }}</div>
+            {% if f.key == "notes" %}
+            <textarea class="fc" id="{{ f.key }}" name="{{ f.key }}" rows="2"></textarea>
+            {% else %}
+            <input class="fc{% if f.key in ('username','email','phone','domain','file') %} mono{% endif %}" type="text" id="{{ f.key }}" name="{{ f.key }}">
+            {% endif %}
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+  </form>
+
+  <div class="box">
+    <h3>Recent cases</h3>
+    {% if cases %}
+    <table class="list">
+      <thead><tr><th>Case</th><th>Scanned</th><th>Verified</th></tr></thead>
+      <tbody>
+      {% for c in cases %}
+      <tr><td><a href="/case/{{ c.folder }}">{{ c.stem }}</a></td><td class="mut">{{ c.when }}</td>
+          <td>{% if c.verified is not none %}{{ c.verified }}{% else %}—{% endif %}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}<p class="mut" style="margin:0">No cases yet.</p>{% endif %}
+  </div>
+</main>
+
+<div class="modal" id="modal">
+  <div class="win">
+    <div class="hd"><span class="pulse"></span><span id="mtitle">Scanning…</span></div>
+    <div class="term" id="term"></div>
+    <div class="ft"><span id="mstatus">running the tools…</span><span id="mlink"></span></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+let files = [];
+const input = $("#photoInput"), drop = $("#drop"), grid = $("#photos"), count = $("#photoCount");
+["dragenter", "dragover"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add("over"); }));
+["dragleave", "drop"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove("over"); }));
+drop.addEventListener("drop", e => addFiles(e.dataTransfer.files));
+input.addEventListener("change", () => { addFiles(input.files); input.value = ""; });
+function addFiles(list) {
+  for (const f of list) if (f.type.startsWith("image/") && files.length < 8) files.push(f);
+  render();
+}
+function render() {
+  grid.innerHTML = "";
+  files.forEach((f, i) => {
+    const d = document.createElement("div"); d.className = "photo";
+    d.innerHTML = `<button type="button" class="rm" title="remove">×</button><img alt=""><div class="nm"></div><div class="mut" style="font-size:10px">${Math.round(f.size / 1024)} KB</div>`;
+    d.querySelector("img").src = URL.createObjectURL(f);
+    d.querySelector(".nm").textContent = f.name;
+    d.querySelector(".rm").addEventListener("click", () => { files.splice(i, 1); render(); });
+    grid.appendChild(d);
+  });
+  count.textContent = `${files.length} selected`;
+}
+$("#intake").addEventListener("submit", async e => {
+  e.preventDefault();
+  const fd = new FormData($("#intake"));
+  fd.delete("photos");
+  files.forEach(f => fd.append("photos", f));
+  $("#startBtn").disabled = true;
+  $("#modal").classList.add("on");
+  $("#term").textContent = "starting…\n";
+  try {
+    const r = await (await fetch("/api/run", { method: "POST", body: fd })).json();
+    if (!r.ok) { fail(r.error || "server error"); return; }
+    $("#mtitle").textContent = `Scanning · ${r.case}`;
+    poll(r.job_id);
+  } catch (err) { fail(err.message); }
+});
+function fail(msg) {
+  $("#term").textContent += `\nERROR: ${msg}\n`;
+  $("#mstatus").textContent = "not started";
+  $("#mlink").innerHTML = `<a href="#" id="close">close</a>`;
+  $("#close").addEventListener("click", ev => { ev.preventDefault(); $("#modal").classList.remove("on"); $("#startBtn").disabled = false; });
+}
+async function poll(jid) {
+  let j;
+  try {
+    const r = await fetch(`/api/job/${jid}`);
+    if (r.status === 404) { fail("job not found (was the dashboard restarted?)"); return; }
+    j = await r.json();
+  } catch (e) { setTimeout(() => poll(jid), 2000); return; }
+  const t = $("#term"); const atEnd = t.scrollTop + t.clientHeight >= t.scrollHeight - 40;
+  t.textContent = (j.log || []).join("\n"); if (atEnd) t.scrollTop = t.scrollHeight;
+  if (j.status === "running") { setTimeout(() => poll(jid), 1200); return; }
+  $("#mstatus").textContent = j.status === "done" ? "finished" : `scan ended (${j.status})`;
+  if (j.export) {
+    $("#mlink").innerHTML = `<a href="/case/${encodeURIComponent(j.case)}">open the dashboard →</a>`;
+    if (j.status === "done") setTimeout(() => { window.location.href = `/case/${encodeURIComponent(j.case)}`; }, 1200);
+  } else {
+    $("#mlink").innerHTML = `<a href="#" id="close">close</a>`;
+    $("#close").addEventListener("click", ev => { ev.preventDefault(); $("#modal").classList.remove("on"); $("#startBtn").disabled = false; });
+  }
+}
+</script>
+</body>
+</html>

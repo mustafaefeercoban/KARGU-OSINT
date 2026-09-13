@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>KARGU · {{ case }}</title>
+<link rel="stylesheet" href="/static/leaflet/leaflet.css">
+<link rel="stylesheet" href="/static/dash.css">
+</head>
+<body>
+<header>
+  <h1><span>KARGU</span> Fusion</h1>
+  <span class="case" id="casename">{{ case }}</span>
+  <span class="mut">{{ generated }}</span>
+  <span class="sp"></span>
+  {% if report %}<a href="/case/{{ folder }}/report" target="_blank" rel="noopener">report</a>{% endif %}
+  <a class="btn" href="/new">+ New scan</a>
+  <a href="/">← cases</a>
+</header>
+
+<div class="grid">
+  <section class="panel" id="identity">
+    <h2>Identity <small>SOCMINT · the scanner core</small></h2>
+    <div class="body"></div>
+  </section>
+
+  <section class="panel" id="context">
+    <h2>Context <small>GEOINT · map + open feeds</small></h2>
+    <div class="mapbar">
+      <label>GIBS date <input type="date" id="gibsdate" value="{{ generated[:10] if generated|length >= 10 else '' }}"></label>
+      <button id="sentbtn" title="Sentinel-2 quicklooks around the first pin (needs Copernicus credentials)">Sentinel-2</button>
+      <span class="mut">MODIS true colour · 250 m daily · terrain, not people</span>
+    </div>
+    <div id="map"></div>
+    <div id="geoinfo"></div>
+    <div class="feed">
+      <div class="q"><input id="gq" placeholder="GDELT news query"><button id="gbtn">News</button></div>
+      <div id="feed"><div class="mut">GDELT indexes news actors: an organisation or domain usually appears, a private individual rarely does. Feed queries leave from this machine's own connection, not the scan's Tor route.</div></div>
+      <div class="q"><input id="tq" placeholder="Telegram query"><button id="tbtn">Telegram</button></div>
+      <div id="tfeed"><div class="mut">Telegram search needs TELEGRAM_API_ID / TELEGRAM_API_HASH in config/.env.</div></div>
+    </div>
+  </section>
+
+  <section class="panel" id="visual">
+    <h2>Visual <small>IMINT · pictures, groups, faces</small></h2>
+    <div class="body"></div>
+  </section>
+</div>
+
+<script>window.__CASE__ = {{ case|tojson }}; window.__FOLDER__ = {{ folder|tojson }}; window.__DATA__ = {{ data|safe }};</script>
+<script src="/static/leaflet/leaflet.js"></script>
+<script src="/static/dash.js"></script>
+</body>
+</html>

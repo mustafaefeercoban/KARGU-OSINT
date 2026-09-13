@@ -45,22 +45,23 @@ ve senin makinene aittir — bkz. bölüm 16.
 
 | Komut | Ne yapar |
 |---|---|
-| `kargu-new` | **Soru-cevap sihirbazı.** Adım adım (ad soyad → kullanıcı adları → e-posta → telefon → domain → dosya → not) sorar, doğrular, hedef dosyasını yazar ve taramayı başlatır. |
-| `kargu-ui` | **Yerel web arayüzü** — `http://127.0.0.1:8787`. Terminal tek kullanımlık erişim token'ı taşıyan bir link (`/?t=…`) basar ve tarayıcıda açar; token'sız arayüz 403 döner, basılan linki kullan. Aynı sorular form olarak; tarama canlı log ile akar, bitince rapora link verir. **Terminali kapatma:** siteyi bu komut sunuyor, Ctrl+C ile durur. Port doluysa otomatik bir sonrakini seçer (`--port N`, `--no-browser`). Tarama başlatma isteği CSRF token'ı ve `Origin`/`Host` kontrolüyle korunur: aynı tarayıcıda açık başka bir sitenin arka planda senin adına tarama başlatmasını engeller. |
+| `kargu-new` | **Soru-cevap sihirbazı.** Adım adım (ad soyad → kullanıcı adları → e-posta → telefon → domain → dosya → referans fotoğraf → not) sorar, doğrular, hedef dosyasını yazar ve taramayı başlatır. |
+| `kargu-ui` | **Yerel web arayüzü** — `http://127.0.0.1:8787`. Terminal bu sürece özel erişim token'ı taşıyan bir link (`/?t=…`) basar ve tarayıcıda açar; token'sız arayüz 403 döner, basılan linki kullan. Aynı sorular form olarak; tarama canlı log ile akar, bitince rapora link verir. **Terminali kapatma:** siteyi bu komut sunuyor, Ctrl+C ile durur. Port doluysa otomatik bir sonrakini seçer (`--port N`, `--no-browser`). Tarama başlatma isteği CSRF token'ı ve `Origin`/`Host` kontrolüyle korunur: aynı tarayıcıda açık başka bir sitenin arka planda senin adına tarama başlatmasını engeller. |
 | `kargu <hedef.txt>` | Elle hazırladığın hedef dosyasıyla klasik çalıştırma. Rapor txt'nin yanına düşer. |
+| `kargu-dash` | **Füzyon paneli** (`http://127.0.0.1:8788`): sürükle-bırak referans fotoğraflı "Yeni tarama" formu, sonra her vaka için tek sayfa — solda kimlik, ortada harita + açık kaynak akışları, sağda resimler / aynı-fotoğraf kümeleri / yüz eşleştirme. `kargu-ui` ile aynı token bağlantısı ve CSRF koruması. Bölüm 17. |
 | `kargu-tor start` | `--tor` taramaları için yerel Tor istemcisini başlatır (root gerekmez). `stop` / `status` da var. |
 
 ### `kargu-new` nasıl görünür
 
 ```
-[1/7] Full name
+[1/8] Full name
       First and last name of the target. Used to derive candidate usernames.
       e.g. John Doe
       Type "no" (or press Enter) to skip this step.
       > Ayşe Nur Güneş
       · recorded: Ayşe Nur Güneş
 
-[2/7] Usernames / handles
+[2/8] Usernames / handles
       Nicknames this person commonly uses. Separate several with commas.
       e.g. johndoe, jdoe_92, jd.doe   ·  separate multiple values with commas
       > aysegunes, ayse_92
@@ -80,12 +81,17 @@ kargu-new --name vaka1     # vaka adını önceden ver
 kargu-new --no-run         # sadece hedef dosyasını yaz, tarama yapma
 ```
 
-## 2) Çıktılar — her tarama = **tek klasör, iki dosya**
+## 2) Çıktılar — her tarama = **tek klasör**
 
 ```
 ~/osint/cases/<vaka>_<tarih>/
-├── <vaka>.txt     profil + sonunda AUTO-FINDINGS bloğu (bulunan hesaplar, siteler, telefon…)
-└── <vaka>.html    okunaklı rapor
+├── <vaka>.txt          profil + sonunda AUTO-FINDINGS bloğu (bulunan hesaplar, siteler, telefon…)
+├── <vaka>.html         okunaklı rapor (tek dosya, avatarlar gömülü)
+├── <vaka>.json         makine-okunur dışa aktarım — füzyon panelinin okuduğu dosya
+├── images/             yakalanan avatarların ve referans fotoğrafların yüz-kalitesinde kopyaları (--faces için)
+├── refs/               panel formundan yüklenen referans fotoğraflar
+├── <vaka>.vision.json  panelden yeniden çalıştırılan yüz / CLIP sonuçları (isteğe bağlı)
+└── telegram.jsonl      Telegram dinleyicisinin çıktısı, çalıştırırsan (isteğe bağlı)
 ```
 
 HTML rapor: özet kartları (kaç hesap, **kaçı doğrulandı**, kaçı kararsız, kaçı gerçekten
@@ -221,6 +227,10 @@ Hedef gmail kullanan bir birey ise Hunter neredeyse hiçbir şey katmaz — bu y
 | `--no-verify` | bulunan hesap URL'lerini açıp doğrulama (hızlı ama çok gürültülü) |
 | `--no-avatars` | profil fotoğraflarını çekme. **Dikkat:** sadece görsel değil — aynı-fotoğraf eşleştirmesini (bölüm 3'teki `strong` / `possible` kademeleri) ve ters görsel arama linklerini de kapatır |
 | `--no-instagram` | instaloader profil adımını atla |
+| `-i, --image YOL\|URL` | kişinin referans fotoğrafı (tekrarlanabilir; hedef dosyadaki `image:` ile aynı). Yakalanan her profil resmiyle hash üzerinden karşılaştırılır, ters görsel arama bağlantıları üretilir |
+| `--faces` | referans fotoğraflar ile yakalanan resimler arasında yerel InsightFace modeliyle yüz karşılaştırması (**biyometrik işleme — isteğe bağlı, `dashboard/install-ml.sh` gerekir**, bölüm 17) |
+| `--clip` | referans fotoğraflar ile yakalanan resimler arasında CLIP görsel benzerliği (yerel, aynı venv) |
+| `--face-threshold X` | bir yüz çiftinin eşleşme sayılması için gereken kosinüs benzerliği (varsayılan 0.5; ≥ 0.65 güçlü gösterilir) |
 | `--no-lockdown` | tarama süresince Mullvad lockdown modunu açma |
 | `--verify-workers N` | doğrulamadaki paralel istek sayısı (varsayılan 8) |
 | `--depth N` | korelasyon döngü derinliği. Doğrulama ve domain aşamalarından **sonra** çalışır, yani o aşamaların bulduğu yeni e-postaları da takip eder |
@@ -244,6 +254,7 @@ email: john@example.com
 phone: +90 5xx xxx xx xx
 domain: example.com
 file: /home/user/Pictures/photo.jpg
+image: /home/user/Pictures/portre.jpg
 notes: serbest not
 ```
 
@@ -508,4 +519,67 @@ lockdown'u tarama kendisi açar ve çıkışta eski hâline döndürür, `--no-l
 DNS ayarların. Mullvad'sız çalıştıran biri raporda `direct · <kendi IP'si>` görür ve her isteğin kendi
 bağlantısına atfedildiğini okur — araç onun yerine VPN açmaz. Varsayılan ülke kodu `OSINT_DEFAULT_CC=90`
 (Türkiye); başka ülkedeysen ortam değişkeniyle değiştir.
+
+## 17) Füzyon paneli, referans fotoğraflar ve yerel görüntü analizi
+
+`kargu-dash` yerel bir panel açar (yalnız loopback, yazdırılan bağlantıda sürece özel token, `KARGU_DASH_PORT`):
+
+- **Yeni tarama** (`/new`): sihirbazla aynı alanlar + kişinin **referans fotoğrafları** için sürükle-bırak
+  alanı (en fazla 8 dosya, 15 MB; her yükleme gerçekten görsel olarak çözülmek zorunda). Fotoğraflar vaka
+  klasörüne `refs/` altında kaydedilir, hedef dosyaya `image:` satırları olarak yazılır ve tarama canlı
+  log ile arka planda başlar. Başlatma isteği CSRF token'ı ve `Origin`/`Host` denetimi taşır.
+- **Vaka sayfası** (`/case/<klasör>`), üç panel:
+  - *Kimlik*: özet kartlar, avatarlı doğrulanmış hesaplar, e-posta kayıtları, senin çıkış rotan.
+  - *Bağlam*: OpenStreetMap ve NASA GIBS (MODIS gerçek renk, 250 m — arazi, asla insan) katmanlı Leaflet
+    haritada EXIF GPS iğneleri; GDELT haber araması (ücretsiz, anahtarsız, 5 saniyede bir sorgu — özel
+    kişi nadiren çıkar, kurum/alan adı çıkar); Telegram araması ve dinleyici isabetleri; ilk iğnenin
+    çevresi için Sentinel-2 hızlı görünümleri (anahtarlar için bölüm 18).
+  - *Görsel*: referans fotoğrafların ve eşleştikleri hesaplar, yakalanan profil resimleri ve
+    aynı-fotoğraf kümeleri, yerel görüntü analizi bloğu.
+
+### Referans fotoğraflar ve eşleşme dereceleri
+
+Her referans fotoğraf (`image:` / `-i`) avatarlar gibi hash'lenir (SHA-256, dHash, pHash, merkez
+kırpımlar) ve doğrulanmış her hesabın resmiyle karşılaştırılır. Rapor ve panel her eşleşmeyi etiketler:
+
+| Etiket | Anlamı |
+|---|---|
+| `strong` | bayt-bayt aynı dosya |
+| `possible` | algısal hash toleransta — aynı resim, belki yeniden kodlanmış ya da kırpılmış |
+| `face 0.xx` | InsightFace gömme kosinüsü ≥ eşik (`--faces`); ≥ 0.65 yeşil gösterilir |
+| `CLIP 0.xx` | CLIP resim-resim kosinüsü ≥ 0.85 (`--clip`) — "benziyor", diğerlerinden zayıf |
+
+### Yerel görüntü yığını (`--faces`, `--clip`)
+
+`dashboard/install-ml.sh`, `ml/.venv` oluşturur (`uv` ile Python 3.12, CPU torch, InsightFace `buffalo_l`,
+OpenCLIP ViT-B/32) ve modelleri bir kez `ml/models/` altına indirir; sonrasında `HF_HUB_OFFLINE=1`
+aşamanın dışarıya bağlanmasını engeller. Venv de modeller de depoya girmez. Her şey senin CPU'nda
+çalışır; hiçbir resim makineden çıkmaz. 72 px küçük resimden nadiren kullanılabilir yüz gömmesi
+çıktığı için tarayıcı yakaladığı her avatarın 320 px kopyasını `images/` altında tutar.
+
+`--faces` ile tarama, **aynı yüzü** gösteren hesapları da kümeler (yalnız farklı sitelerde); hesap
+tablosunda `face #n`, raporun 2. bölümünde *Same face* satırları olarak görünür. Panel bitmiş bir vakada
+iki analizi yeniden çalıştırabilir (`Run face matching`); sonuç dışa aktarımın yanına
+`<vaka>.vision.json` olarak kaydedilir ve sonraki açılışta gösterilir. CLIP **metin araması**
+("uniform", "tattoo", "glasses") yakalanan resimleri tarife göre sıralar.
+
+Yüz gömmeleri özel nitelikli biyometrik veridir (KVKK md. 6 / GDPR md. 9): aşama her yerde isteğe
+bağlıdır (bayrak, sihirbaz sorusu, onay kutusu, panelde onay) ve kosinüs skoru bir benzerliktir, kimlik
+değil. İki temiz portre arasındaki `face 0.96` güçlü kanıttır; 40 px avatar ile grup fotoğrafı
+arasındaki `0.52` gözle bakılacak bir ipucudur.
+
+## 18) Açık akışlar: GDELT, Telegram, Sentinel-2
+
+| Akış | Gerekli | Ne verir |
+|---|---|---|
+| GDELT DOC 2.0 (`feeds/gdelt.py`) | hiçbir şey | son 7 günde sorguyu anan haberler; 5 saniyede bir sorgu limiti var, panel buna göre sıraya sokar |
+| Telegram araması (`feeds/telegram_search.py`) | `config/.env` içinde `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, bir kez etkileşimli `--login` | `TELEGRAM_CHANNELS` içinde sorguyla eşleşen mesajlar; boşsa Telegram'ın genel araması |
+| Telegram dinleyicisi (`feeds/telegram_listener.py <vaka-klasörü>`) | aynı anahtarlar + `TELEGRAM_CHANNELS` | her mesajı `telegram.jsonl`'a ekleyen, vaka tohumlarını ananları işaretleyen bir daemon; panel isabetleri gösterir |
+| Sentinel-2 (`feeds/sentinel.py`) | `COPERNICUS_CLIENT_ID/SECRET` (ücretsiz hesap) | bir koordinatın çevresinde son < %40 bulutlu sahneler, 10 m çözünürlük — arazi ve binalar, asla insan |
+
+Akış sorguları (GDELT, Telegram, Sentinel-2) panelin çalıştığı makinenin kendi bağlantısından canlı gider: taramanın
+Tor/proxychains rotasını kullanmazlar; vaka sayfasındaki çıkış etiketi tarama anında ölçülen rotadır.
+Telethon `ml/.venv` içinde çalışır; atılabilir bir Telegram hesabı kullan — otomatik istemciler yasaklanır
+ve oturum dosyası (`config/telegram.session`, git-ignore'da, mod 600) hesaba tam erişim verir.
+Anahtarı eksik bir akış sayfayı bozmak yerine "skipped" / "not configured" der.
 

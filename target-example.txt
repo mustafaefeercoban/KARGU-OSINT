@@ -13,9 +13,12 @@ email:
 phone:
 domain:
 file:
+image:
 
-# "file:" takes a local path (photo/pdf) for the metadata stage. Do not put a comment on
-# the same line as a value — the parser reads everything after the colon as the value.
+# "file:" takes a local path (photo/pdf) for the metadata stage. "image:" is a reference
+# photo of the person (path or URL) to match against the profile pictures the scan finds;
+# add --faces / --clip for the local vision models. Do not put a comment on the same line
+# as a value — the parser reads everything after the colon as the value.
 notes:
 
 # --- EXAMPLE (delete freely) ---
@@ -25,6 +28,7 @@ notes:
 # email: john.doe@example.com
 # domain: example.com
 # file: /home/user/Pictures/photo.jpg
+# image: /home/user/Pictures/john-portrait.jpg
 
 # ==================================================
 #  Usage:

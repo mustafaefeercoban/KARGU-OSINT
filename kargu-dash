@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# KARGU-OSINT fusion dashboard launcher (three-panel view over a finished case).
+OSINT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+export PATH="$OSINT/bin:$PATH"
+PY="${OSINT_PYTHON:-/usr/bin/python3}"
+[ -x "$PY" ] || PY="$(command -v python3)"
+exec "$PY" "$OSINT/dashboard/server.py" "$@"

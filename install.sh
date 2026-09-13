@@ -71,7 +71,7 @@ for pair in sherlock:sherlock-project maigret:maigret update_sitesmd:maigret hol
   cmd="${pair%%:*}"; venv="${pair##*:}"
   ln -sfn "../pipx/venvs/$venv/bin/$cmd" "bin/$cmd"
 done
-chmod +x bin/exiftool bin/theHarvester bin/sf kargu kargu-new kargu-ui kargu-tor
+chmod +x bin/exiftool bin/theHarvester bin/sf kargu kargu-new kargu-ui kargu-tor kargu-dash dashboard/install-ml.sh
 ok "bin/ populated"
 
 step "Runtime directories and config"
@@ -96,8 +96,8 @@ else warn "docker missing: --deep (SpiderFoot) unavailable"; fi
 
 step "Shortcuts"
 mkdir -p "$HOME/.local/bin"
-for c in kargu kargu-new kargu-ui kargu-tor; do ln -sfn "$OSINT/$c" "$HOME/.local/bin/$c"; done
-ok "kargu, kargu-new, kargu-ui, kargu-tor -> ~/.local/bin"
+for c in kargu kargu-new kargu-ui kargu-tor kargu-dash; do ln -sfn "$OSINT/$c" "$HOME/.local/bin/$c"; done
+ok "kargu, kargu-new, kargu-ui, kargu-tor, kargu-dash -> ~/.local/bin"
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) warn "~/.local/bin is not on PATH";; esac
 
 step "Self-test"

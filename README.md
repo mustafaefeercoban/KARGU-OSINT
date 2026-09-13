@@ -35,6 +35,7 @@ are installed inside the folder and are not committed. On a fresh clone:
 git clone <repo> osint && cd osint
 python3 -m pip install --user -r requirements.txt   # flask, requests, Pillow, PySocks
 ./install.sh    # pipx + 7 tools + theHarvester + ExifTool + PhoneInfoga — all under this folder
+dashboard/install-ml.sh   # optional: local face matching + CLIP (Python 3.12 venv under ml/, ~2 GB), see section 17
 ```
 
 `install.sh` is re-runnable (skips what is present) and ends by running the tests and trying every tool. It does
@@ -46,22 +47,23 @@ and belong to your machine — see section 16.
 
 | Command | What it does |
 |---|---|
-| `kargu-new` | **Q&A wizard.** Asks step by step (full name → usernames → e-mail → phone → domain → file → notes), validates, writes the target file and starts the scan. |
-| `kargu-ui` | **Local web interface** on `http://127.0.0.1:8787`. The terminal prints a link carrying a one-time access token (`/?t=…`) and opens it in the browser; without that token the UI answers 403, so use the printed link. Same questions as a form; the scan streams with a live log and links to the report when done. **Don't close the terminal:** this command is what serves the site, Ctrl+C stops it. If the port is taken it automatically picks the next one (`--port N`, `--no-browser`). The scan-start request is protected by a CSRF token and an `Origin`/`Host` check: it prevents another site open in the same browser from starting a scan on your behalf in the background. |
+| `kargu-new` | **Q&A wizard.** Asks step by step (full name → usernames → e-mail → phone → domain → file → reference photos → notes), validates, writes the target file and starts the scan. |
+| `kargu-ui` | **Local web interface** on `http://127.0.0.1:8787`. The terminal prints a link carrying this process's access token (`/?t=…`) and opens it in the browser; without that token the UI answers 403, so use the printed link. Same questions as a form; the scan streams with a live log and links to the report when done. **Don't close the terminal:** this command is what serves the site, Ctrl+C stops it. If the port is taken it automatically picks the next one (`--port N`, `--no-browser`). The scan-start request is protected by a CSRF token and an `Origin`/`Host` check: it prevents another site open in the same browser from starting a scan on your behalf in the background. |
 | `kargu <target.txt>` | Classic run with a target file you prepared by hand. The report lands next to the txt. |
+| `kargu-dash` | **Fusion dashboard** on `http://127.0.0.1:8788`: a "New scan" form with drag-and-drop reference photos, then one page per case — identity on the left, map + open feeds in the middle, pictures / same-photo groups / face matching on the right. Same token link and CSRF protection as `kargu-ui`. Section 17. |
 | `kargu-tor start` | Starts the local Tor client for `--tor` scans (no root needed). `stop` / `status` also exist. |
 
 ### What `kargu-new` looks like
 
 ```
-[1/7] Full name
+[1/8] Full name
       First and last name of the target. Used to derive candidate usernames.
       e.g. John Doe
       Type "no" (or press Enter) to skip this step.
       > Ayşe Nur Güneş
       · recorded: Ayşe Nur Güneş
 
-[2/7] Usernames / handles
+[2/8] Usernames / handles
       Nicknames this person commonly uses. Separate several with commas.
       e.g. johndoe, jdoe_92, jd.doe   ·  separate multiple values with commas
       > aysegunes, ayse_92
@@ -73,7 +75,8 @@ fields you separate values with **commas**. If you enter an invalid value (malfo
 the script warns and asks again. At the end a summary table + confirmation appears, then the scan starts.
 
 Options are asked too: whether to derive candidate usernames (how many), whether to use API
-sources, whether to go through Tor, whether to enable the SpiderFoot deep scan.
+sources, whether to go through Tor, whether to enable the SpiderFoot deep scan, and — when the
+local vision stack is installed — whether to run face matching / CLIP on the pictures.
 
 ```bash
 kargu-new                  # full wizard
@@ -81,12 +84,17 @@ kargu-new --name case1     # pre-set the case name
 kargu-new --no-run         # only write the target file, do not scan
 ```
 
-## 2) Output — every scan = **one folder, two files**
+## 2) Output — every scan = **one folder**
 
 ```
 ~/osint/cases/<case>_<date>/
-├── <case>.txt     profile + AUTO-FINDINGS block at the end (accounts found, sites, phone…)
-└── <case>.html    readable report
+├── <case>.txt          profile + AUTO-FINDINGS block at the end (accounts found, sites, phone…)
+├── <case>.html         readable report (self-contained, avatars embedded)
+├── <case>.json         machine-readable export — what the fusion dashboard reads
+├── images/             face-grade copies of the captured avatars and reference photos (for --faces)
+├── refs/               reference photos uploaded through the dashboard form
+├── <case>.vision.json  face / CLIP results re-run from the dashboard (optional)
+└── telegram.jsonl      output of the Telegram listener, if you run it (optional)
 ```
 
 HTML report: summary cards (how many accounts, **how many verified**, how many undecided, how many genuinely
@@ -100,7 +108,7 @@ table; they sit in a **collapsed "Undecided" block grouped by site**: they are n
 per row they buried the real results. Nothing is dropped — the block expands on click and every handle is linked.
 
 No matter how many tests you run, each case stays in its own folder; the `data/` and `reports/` folders
-are gone.
+are gone. Only cases scanned with the current engine have a `.json` and show up in the dashboard.
 
 If you scan the same case again, the AUTO-FINDINGS block is **overwritten**; a second block is not
 appended below, so two contradicting result sets don't build up inside the `.txt`. The block is delimited
@@ -223,6 +231,10 @@ If you're going to investigate a company domain, it's very useful.
 | `--no-verify` | don't open and verify the account URLs found (fast but very noisy) |
 | `--no-avatars` | don't fetch profile photos. **Careful:** not just the images — it also turns off same-photo matching (the `strong` / `possible` tiers in section 3) and the reverse image search links |
 | `--no-instagram` | skip the instaloader profile step |
+| `-i, --image PATH\|URL` | a reference photo of the person (repeatable; same as `image:` in the target file). Hashed against every captured profile picture; reverse-search links are generated |
+| `--faces` | compare faces across the reference photos and the captured pictures with the local InsightFace model (**biometric processing — opt-in, needs `dashboard/install-ml.sh`**, section 17) |
+| `--clip` | CLIP visual similarity between the reference photos and the captured pictures (local, same venv) |
+| `--face-threshold X` | cosine similarity a face pair must reach to count (default 0.5; ≥ 0.65 is shown as strong) |
 | `--no-lockdown` | do not enable Mullvad lockdown mode for the duration of the scan |
 | `--verify-workers N` | number of parallel requests in verification (default 8) |
 | `--depth N` | correlation loop depth. Runs **after** the verification and domain stages, so it also follows the new e-mails those stages found |
@@ -230,7 +242,7 @@ If you're going to investigate a company domain, it's very useful.
 
 Environment variables (no flag equivalent): `OSINT_PYTHON` (interpreter to use),
 `OSINT_DEFAULT_CC` (country code substituted for a leading `0`, default `90`),
-`OSINT_TOR_PORT` (for `kargu-tor`), `OSINT_UI_PORT`.
+`OSINT_TOR_PORT` (for `kargu-tor`), `OSINT_UI_PORT`, `KARGU_DASH_PORT`.
 
 **Phone format:** national notation like `0532 …` is automatically converted to `+90532…`.
 (Previously `+0532…` was produced — there is no country code 0 in E.164, so the report was
@@ -246,10 +258,13 @@ email: john@example.com
 phone: +90 5xx xxx xx xx
 domain: example.com
 file: /home/user/Pictures/photo.jpg
+image: /home/user/Pictures/portrait.jpg
 notes: free text
 ```
 
-Template: `target-example.txt` (copy it, fill it in, `kargu file.txt`).
+`file:` is a document whose metadata gets extracted; `image:` is a picture **of the person** (path or
+URL) that is matched against the profile pictures the scan finds. Template: `target-example.txt`
+(copy it, fill it in, `kargu file.txt`).
 
 ## 7) Installed tools
 
@@ -485,11 +500,12 @@ the AUTO-FINDINGS rewrite, target-file parsing, the avatar fetch guard and repor
 No network, API key or target is needed — the HTTP layer is replaced with fixed samples:
 
 ```bash
-/usr/bin/python3 tests/test_verify.py      # or: /usr/bin/python3 -m unittest discover tests
+/usr/bin/python3 -m unittest discover tests      # or: python3 -m pytest tests/
 ```
 
 Use the system interpreter (the one the launchers pin via `OSINT_PYTHON`): a `python3` from a pipx venv
-lacks Pillow and one avatar test errors. 38 tests, all offline.
+lacks Pillow and Flask. About 100 tests, all offline; the vision stage is tested through its merge rules
+and a stand-in result, so the ML venv is not needed to run them.
 
 Every case in the tests represents a bug that actually shipped: the consent screen being counted as
 `verified`, the handle appearing only inside an `href` being mistaken for evidence,
@@ -511,4 +527,67 @@ lockdown is enabled by the scan itself and restored on exit, `--no-lockdown` opt
 DNS setup. Someone running without Mullvad sees `direct · <their own IP>` in the report and reads that every
 request is attributable to their connection — the tool does not turn a VPN on for them. The default country code
 is `OSINT_DEFAULT_CC=90` (Türkiye); set the environment variable if you are elsewhere.
+
+## 17) Fusion dashboard, reference photos and local vision
+
+`kargu-dash` serves a local dashboard (loopback, a per-process token in the printed link, `KARGU_DASH_PORT`):
+
+- **New scan** (`/new`): the same fields as the wizard plus a drop zone for **reference photos of the
+  person** (up to 8, 15 MB each; every upload must decode as an image). They are saved under the case
+  folder as `refs/`, written into the target file as `image:` lines, and the scan starts in the
+  background with a live log. The start request carries a CSRF token and an `Origin`/`Host` check.
+- **Case page** (`/case/<folder>`), three panels:
+  - *Identity*: summary cards, verified accounts with their avatars, e-mail registrations, your exit route.
+  - *Context*: Leaflet map with OpenStreetMap and NASA GIBS (MODIS true colour, 250 m — terrain, never
+    people) showing EXIF GPS pins; GDELT news search (free, keyless, one query every 5 s — a private
+    person rarely appears, an organisation or domain does); Telegram search and listener hits;
+    Sentinel-2 quicklooks around the first pin (section 18 for the keys).
+  - *Visual*: your reference photos with the accounts they matched, the captured profile pictures and
+    same-photo groups, and the local vision block.
+
+### Reference photos and how a match is graded
+
+Every reference photo (`image:` / `-i`) is hashed like an avatar (SHA-256, dHash, pHash, centre crops)
+and compared with every verified account's picture. The report and the dashboard label each match:
+
+| Tag | Meaning |
+|---|---|
+| `strong` | byte-identical file |
+| `possible` | perceptual hash within tolerance — same picture, maybe re-encoded or cropped |
+| `face 0.xx` | InsightFace embedding cosine ≥ threshold (`--faces`); ≥ 0.65 is shown green |
+| `CLIP 0.xx` | CLIP image-image cosine ≥ 0.85 (`--clip`) — "looks alike", weaker than the others |
+
+### Local vision stack (`--faces`, `--clip`)
+
+`dashboard/install-ml.sh` creates `ml/.venv` (Python 3.12 via `uv`, CPU torch, InsightFace `buffalo_l`,
+OpenCLIP ViT-B/32) and downloads the models into `ml/models/` once; afterwards `HF_HUB_OFFLINE=1` keeps the
+stage from phoning home. Neither the venv nor the models are committed. Everything runs on your CPU;
+no picture leaves the machine. The scanner keeps a 320 px copy of every captured avatar under
+`images/` because a 72 px thumbnail rarely yields a usable face embedding.
+
+With `--faces` the scan also groups accounts whose pictures show the **same face** (different hosts
+only), reported as `face #n` in the account table and as *Same face* rows in section 2 of the report.
+The dashboard can re-run both analyses on a finished case (`Run face matching`); the result is saved
+as `<case>.vision.json` next to the export and shown on the next load. A CLIP **text search**
+("uniform", "tattoo", "glasses") ranks the captured pictures by description.
+
+Face embeddings are special-category biometric data (KVKK art. 6 / GDPR art. 9): the stage is opt-in
+everywhere (flag, wizard question, checkbox, confirmation in the dashboard) and a cosine score is a
+similarity, not an identity. A `face 0.96` between two clean portraits is strong evidence; a `0.52`
+between a 40 px avatar and a group photo is a hint to check by eye.
+
+## 18) Open feeds: GDELT, Telegram, Sentinel-2
+
+| Feed | Needs | What you get |
+|---|---|---|
+| GDELT DOC 2.0 (`feeds/gdelt.py`) | nothing | news articles mentioning the query in the last 7 days; rate-limited to one query per 5 s, the dashboard queues accordingly |
+| Telegram search (`feeds/telegram_search.py`) | `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` in `config/.env`, one interactive `--login` | messages matching the query in `TELEGRAM_CHANNELS`, or Telegram's global search when that is empty |
+| Telegram listener (`feeds/telegram_listener.py <case-folder>`) | same keys plus `TELEGRAM_CHANNELS` | a daemon appending every message to `telegram.jsonl` and flagging the ones that mention a case seed; the dashboard shows the hits |
+| Sentinel-2 (`feeds/sentinel.py`) | `COPERNICUS_CLIENT_ID/SECRET` (free account) | recent < 40 % cloud scenes around a coordinate, 10 m resolution — terrain and buildings, never people |
+
+Feed queries (GDELT, Telegram, Sentinel-2) are sent live from the dashboard host over its own connection: they do
+not use the scan's Tor/proxychains route, and the exit tag on the case page is the route measured at scan time.
+Telethon runs inside `ml/.venv`; use a throwaway Telegram account — automated clients get banned and the
+session file (`config/telegram.session`, git-ignored, mode 600) grants full account access. A feed whose
+key is missing reports "skipped" or "not configured" instead of failing the page.
 

@@ -6,9 +6,8 @@ KARGU-OSINT · local web UI (English).
 Same intake questions as the console wizard, but as a form; runs the scan in the
 background, streams the log live, and links straight to the readable HTML report.
 
-Every scan produces ONE folder under ~/osint/cases/ holding exactly two files:
-    <case>.txt   the profile + the findings appended at the end
-    <case>.html  the readable report
+Every scan produces ONE folder under cases/: <case>.txt (profile + findings), <case>.html
+(the report) and <case>.json (the export the fusion dashboard reads).
 
 Usage:  kargu-ui [--port N] [--no-browser]
 Binds to localhost only and opens the browser automatically.
@@ -17,7 +16,7 @@ import argparse, datetime, html, os, pathlib, re, secrets, socket, subprocess, s
 from urllib.parse import urlparse
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from osint_wizard import FIELDS, slugify, build_profile_text  # noqa: E402
+from osint_wizard import FIELDS, ML_PY, slugify, build_profile_text  # noqa: E402
 
 from flask import Flask, request, redirect, url_for, jsonify, send_file, abort
 
@@ -50,7 +49,7 @@ def _require_access_token():
         resp.set_cookie(ACCESS_COOKIE, ACCESS_TOKEN, httponly=True, samesite="Strict")
         return resp
     abort(403, "This KARGU-OSINT UI is private to the terminal that started it. Open the "
-               "link printed there — it carries a one-time access token.")
+               "link printed there — it carries this process's access token.")
 
 def _same_origin_ok(req):
     """Reject cross-site submissions and DNS-rebinding hosts before anything is launched."""
@@ -123,7 +122,10 @@ def index():
              "<label><input type='checkbox' name='api' checked> API sources</label>"
              "<label><input type='checkbox' name='tor'> route via Tor</label>"
              "<label><input type='checkbox' name='deep'> SpiderFoot deep scan</label>"
-             "</div><button type='submit'>Start scan</button></form>")
+             + ("<label><input type='checkbox' name='faces'> local face matching (biometric — lawful basis required)</label>"
+                "<label><input type='checkbox' name='clip'> CLIP similarity for reference photos</label>"
+                if ML_PY.exists() else "")
+             + "</div><button type='submit'>Start scan</button></form>")
 
     reps = list_reports()
     f.append("<h2>Previous cases</h2>")
@@ -188,6 +190,8 @@ def start_run():
     if not request.form.get("api"):    cmd.append("--no-api")
     if request.form.get("tor"):        cmd.append("--tor")
     if request.form.get("deep"):       cmd.append("--deep")
+    if request.form.get("faces") and ML_PY.exists(): cmd.append("--faces")
+    if request.form.get("clip") and ML_PY.exists():  cmd.append("--clip")
 
     jid = uuid.uuid4().hex[:10]
     JOBS[jid] = {"log": [f"$ {' '.join(cmd)}"], "status": "running", "case": folder.name, "report": None}
@@ -276,7 +280,7 @@ if __name__ == "__main__":
     url = f"http://127.0.0.1:{port}/?t={ACCESS_TOKEN}"
     print(f"\n  KARGU-OSINT UI  ->  {url}")
     print("  Keep this terminal open; the site is served by this process.")
-    print("  The link carries a one-time access token — without it the UI answers 403.")
+    print("  The link carries this process's access token — without it the UI answers 403.")
     print("  Press Ctrl+C to stop.\n", flush=True)
     if not a.no_browser:
         threading.Thread(target=open_browser, args=(url,), daemon=True).start()

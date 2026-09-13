@@ -16,7 +16,7 @@ import argparse, datetime, os, pathlib, re, subprocess, sys
 HOME = pathlib.Path.home()
 # Same anchor as osint_run.py: this file's own directory, overridable with OSINT_HOME.
 OSINT = pathlib.Path(os.environ.get("OSINT_HOME") or pathlib.Path(__file__).resolve().parent)
-CASES = OSINT / "cases"     # every scan gets ONE folder: <case>.txt + <case>.html
+CASES = OSINT / "cases"     # every scan gets ONE folder: <case>.txt + .html + .json
 CASES.mkdir(parents=True, exist_ok=True)
 
 TTY = sys.stdout.isatty()
@@ -67,6 +67,20 @@ def v_file(x):
 def v_any(x):
     return (True, x.strip())
 
+def v_image(x):
+    x = x.strip().strip("'\"")
+    if x.startswith(("http://", "https://")):
+        return (True, x)
+    p = pathlib.Path(x).expanduser()
+    if not p.is_file():
+        return (False, f"file not found: {p}")
+    if p.suffix.lower() not in IMAGE_EXTS:
+        return (False, "not an image file (jpg, png, webp, bmp, gif)")
+    return (True, str(p))
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
+ML_PY = OSINT / "ml" / ".venv" / "bin" / "python"   # optional local vision stack (dashboard/install-ml.sh)
+
 # ---------------- question definitions (shared with the web UI) ----------------
 FIELDS = [
     dict(key="name",     title="Full name",
@@ -87,6 +101,9 @@ FIELDS = [
     dict(key="file",     title="Files for metadata",
          hint="Photo or PDF paths — EXIF/GPS and author fields get extracted.",
          example="/home/user/Desktop/photo.jpg", multi=True, validator=v_file),
+    dict(key="image",    title="Reference photos of the target",
+         hint="Pictures of the person (paths or URLs). Matched against the profile photos the scan finds.",
+         example="/home/user/Pictures/target.jpg, https://example.com/photo.jpg", multi=True, validator=v_image),
     dict(key="notes",    title="Free notes",
          hint="Anything else worth recording in the report (city, employer, age...).",
          example="Lives in Istanbul, studies CS", multi=False, validator=v_any),
@@ -178,6 +195,8 @@ def summary(profile, case, opts):
     print(f"  {'SpiderFoot deep scan':<24} {'yes' if opts['deep'] else 'no'}")
     print(f"  {'API sources':<24} {'enabled' if opts['api'] else 'disabled'}")
     print(f"  {'Correlation depth':<24} {opts['depth']}")
+    print(f"  {'Local face matching':<24} {'yes' if opts.get('faces') else 'no'}")
+    print(f"  {'CLIP similarity':<24} {'yes' if opts.get('clip') else 'no'}")
     print(CY("──────────────────────────────────────────────────────────"))
     return empty
 
@@ -233,6 +252,14 @@ def main():
     opts["tor"]   = ask_yes("Route the tools through Tor (proxychains)?", False)
     opts["deep"]  = ask_yes("Run the SpiderFoot deep scan (slow)?", False)
     opts["depth"] = 1
+    opts["faces"] = opts["clip"] = False
+    if ML_PY.exists():
+        print(DIM("      Local vision stack found (ml/.venv). Face matching is biometric processing:"))
+        print(DIM("      use it only with a lawful basis for this target."))
+        opts["faces"] = ask_yes("Compare faces across the pictures found (local, --faces)?", False)
+        opts["clip"]  = ask_yes("CLIP visual similarity for reference photos (local, --clip)?", False)
+    elif profile.get("image"):
+        print(DIM("      Face matching needs the local vision stack: dashboard/install-ml.sh"))
 
     if summary(profile, case, opts):
         print(RD("Nothing to scan.")); sys.exit(1)
@@ -260,6 +287,8 @@ def main():
     if opts["tor"]:  cmd.append("--tor")
     if opts["deep"]: cmd.append("--deep")
     if not opts["api"]: cmd.append("--no-api")
+    if opts.get("faces"): cmd.append("--faces")
+    if opts.get("clip"):  cmd.append("--clip")
 
     env = dict(os.environ)
     env["PATH"] = f"{OSINT/'bin'}:{env.get('PATH','')}"

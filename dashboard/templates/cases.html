@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>KARGU · cases</title>
+<link rel="stylesheet" href="/static/dash.css">
+</head>
+<body>
+<header>
+  <h1><span>KARGU</span> Fusion</h1>
+  <span class="sp"></span>
+  <a class="btn" href="/new">+ New scan</a>
+</header>
+<main class="page">
+  <h2 class="ttl">Cases</h2>
+  <p class="mut">Every scan made with the current engine leaves a JSON export next to its report; those open here.</p>
+  {% if cases %}
+  <table class="list">
+    <thead><tr><th>Case</th><th>Scanned</th><th>Verified</th><th>Exit</th><th></th></tr></thead>
+    <tbody>
+    {% for c in cases %}
+      <tr>
+        <td><a href="/case/{{ c.folder }}">{{ c.stem }}</a><div class="mut mono">{{ c.folder }}</div></td>
+        <td class="mut">{{ c.when }}</td>
+        <td>{% if c.verified is not none %}{{ c.verified }} <span class="mut">/ {{ c.accounts }}</span>{% else %}—{% endif %}</td>
+        <td>{% if c.route %}<span class="tag {{ c.route_cls }}">{{ c.route }}</span>{% endif %}</td>
+        <td>{% if c.faces %}<span class="tag info">vision</span>{% endif %}{% if c.error %}<span class="tag bad">{{ c.error }}</span>{% endif %}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="mut">No case has a JSON export yet. Start one with “New scan”.</p>
+  {% endif %}
+  {% if not ml %}<p class="note">Local face matching and CLIP are off: run <code>dashboard/install-ml.sh</code> to enable them.</p>{% endif %}
+</main>
+</body>
+</html>

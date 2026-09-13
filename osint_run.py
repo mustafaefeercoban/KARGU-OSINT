@@ -25,9 +25,13 @@ HOME = pathlib.Path.home()
 # anyone keeping the data apart from the code.
 OSINT = pathlib.Path(os.environ.get("OSINT_HOME") or pathlib.Path(__file__).resolve().parent)
 BIN = OSINT / "bin"
-CASES = OSINT / "cases"          # one folder per investigation: <case>.txt + <case>.html
+CASES = OSINT / "cases"          # one folder per investigation: <case>.txt + .html + .json
 RESOURCES = OSINT / "resources"  # vendored OSINT Framework dataset (MIT, see SOURCE.md)
 CONFIG = OSINT / "config"
+ML_PY = OSINT / "ml" / ".venv" / "bin" / "python"   # optional local vision stack (dashboard/install-ml.sh)
+VISION_PY = OSINT / "ml" / "vision.py"
+FACE_STRONG = 0.65                                   # InsightFace cosine read as a confident same-person call
+IMAGES_DIR = None                                    # <case folder>/images, set by main(); None in tests
 for d in (CASES, CONFIG):
     d.mkdir(parents=True, exist_ok=True)
 
@@ -261,7 +265,7 @@ def _fail(rc, err, parsed):
     return _redact(f"exited {rc}" + (f": {tail}" if tail else ""))
 
 # ---------------- target parsing ----------------
-LIST_KEYS = {"name", "username", "email", "phone", "domain", "file", "notes"}
+LIST_KEYS = {"name", "username", "email", "phone", "domain", "file", "image", "notes"}
 def parse_target(path):
     prof = {k: [] for k in LIST_KEYS}
     raw = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
@@ -272,9 +276,10 @@ def parse_target(path):
         if ":" in s:
             k, v = s.split(":", 1)
             k = k.strip().lower(); v = v.strip()
-            if k == "file" and v:
+            if k in ("file", "image") and v:
                 # Only ~ is expanded: expandvars() would put "$HUNTER_API_KEY" into the report.
-                v = os.path.expanduser(v)
+                if not (v.startswith("http://") or v.startswith("https://")):
+                    v = os.path.expanduser(v)
             if k in prof and v:
                 if v.startswith("-"):
                     # Identifiers reach external tools as positional arguments; "--help"
@@ -307,7 +312,7 @@ def derive_usernames(prof, cap=3):
         if len(parts) >= 2:
             add("".join(parts))              # aysenurgunes
             add(parts[0] + parts[-1])        # aysegunes
-            add(parts[0] + "." + parts[-1])  # mustafa.ercoban
+            add(parts[0] + "." + parts[-1])  # ayse.gunes
             add(parts[-1] + parts[0])        # gunesayse
     return cands[:cap]
 
@@ -920,6 +925,13 @@ def reverse_image_links(img_url):
             ("Bing Visual Search", f"https://www.bing.com/images/search?view=detailv2&iss=sbi&q=imgurl:{e}"),
             ("TinEye", f"https://tineye.com/search?url={e}")]
 
+def local_image_search_links():
+    """Direct search portal links for a local target image (manual upload / drag & drop)."""
+    return [("Google Lens", "https://lens.google.com/"),
+            ("Yandex Images", "https://yandex.com/images/"),
+            ("Bing Visual Search", "https://www.bing.com/images/search?view=detailv2&iss=sbi"),
+            ("TinEye", "https://tineye.com/")]
+
 # ---------------- STAGE: INSTAGRAM PROFILE (instaloader) ----------------
 # Anonymous requests get 429; needs a session file (instaloader --login=<burner>) or it skips.
 IG_PY = OSINT / "pipx" / "venvs" / "instaloader" / "bin" / "python"
@@ -987,6 +999,7 @@ def enrich_instagram(findings, usernames, use_tor=False, fetch_avatar=True):
             r["avatar"], r["avatar_hash"], r["avatar_src"], r["avatar_sha256"] = th
             r["avatar_hashes"] = getattr(th, "hashes", {})
             r["avatar_is_generated"] = getattr(th, "is_generated", False)
+            r["avatar_file"] = _save_image(r["avatar_sha256"], getattr(th, "hd", b""))
         res[u] = r
         if not r.get("ok"):
             continue
@@ -1006,6 +1019,8 @@ def enrich_instagram(findings, usernames, use_tor=False, fetch_avatar=True):
             row["avatar_sha256"] = r.get("avatar_sha256")
             row["avatar_hashes"] = r.get("avatar_hashes", {})
             row["avatar_is_generated"] = r.get("avatar_is_generated", False)
+            if r.get("avatar_file"):
+                row["avatar_file"] = r["avatar_file"]
         extra = [x for x in (r.get("business_email"),) if x]
         row["emails"] = sorted(set((row.get("emails") or []) + extra))
     findings["instagram"] = res
@@ -1367,16 +1382,36 @@ def _is_generated_avatar(im):
         return False
 
 class ThumbResult(tuple):
-    """Subclass of 4-tuple (data_uri, hash_hex, url, sha256) for complete backwards compatibility,
-    with attached attributes for perceptual hashes, center-crop hashes, generated avatar flags,
-    and discovered cover/banner image."""
-    def __new__(cls, data_uri="", hash_hex="", url="", sha256="", hashes=None, is_generated=False, cover=None):
+    """4-tuple (data_uri, hash_hex, url, sha256) plus perceptual hashes, the generated-avatar
+    flag, a discovered cover image and `hd`, a face-grade JPEG copy for the vision stage."""
+    def __new__(cls, data_uri="", hash_hex="", url="", sha256="", hashes=None, is_generated=False, cover=None, hd=b""):
         return super().__new__(cls, (data_uri, hash_hex, url, sha256))
 
-    def __init__(self, data_uri="", hash_hex="", url="", sha256="", hashes=None, is_generated=False, cover=None):
+    def __init__(self, data_uri="", hash_hex="", url="", sha256="", hashes=None, is_generated=False, cover=None, hd=b""):
         self.hashes = hashes or {}
         self.is_generated = is_generated
         self.cover = cover or {}
+        self.hd = hd
+
+def _jpeg_copy(im, px, quality):
+    c = im.convert("RGB")
+    c.thumbnail((px, px))
+    buf = io.BytesIO()
+    c.save(buf, "JPEG", quality=quality)
+    return buf.getvalue()
+
+def _save_image(sha, blob):
+    """Keep a picture under <case>/images/ for the vision stage; "" when no case folder is set."""
+    if not (IMAGES_DIR and blob and sha):
+        return ""
+    try:
+        IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+        f = IMAGES_DIR / f"{sha[:16]}.jpg"
+        if not f.exists():
+            f.write_bytes(blob)
+        return f"images/{f.name}"
+    except OSError:
+        return ""
 
 def _fetch_target_ok(url):
     """Refuse to fetch anything that is not a public http(s) host.
@@ -1458,13 +1493,10 @@ def _thumb_one(url, px, timeout):
                         "phash": hsh_p,
                         "phash_center": hsh_pc,
                     }
-                    im_thumb = im.convert("RGB")
-                    im_thumb.thumbnail((px, px))
-                    buf = io.BytesIO()
-                    im_thumb.save(buf, "JPEG", quality=78)
-                    data_uri = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+                    data_uri = "data:image/jpeg;base64," + base64.b64encode(_jpeg_copy(im, px, 78)).decode()
+                    # 72 px is enough for the report; face embeddings need the larger copy.
                     res = ThumbResult(data_uri, f"{hsh_d:016x}", url, sha,
-                                      hashes=hashes, is_generated=is_gen)
+                                      hashes=hashes, is_generated=is_gen, hd=_jpeg_copy(im, 320, 85))
                 elif is_cover:
                     im_cov = im.convert("RGB")
                     im_cov.thumbnail((240, 120))
@@ -1506,6 +1538,254 @@ def _thumb(urls, px=72, timeout=12):
             avatar_res.cover = cover_res
         return avatar_res
     return ThumbResult("", "", "", "", cover=cover_res or {})
+
+def process_target_image(path_or_url, px=140, timeout=15):
+    """Process an operator-supplied target reference image (local path or remote URL).
+    Returns a dict with hashes, thumbnail data URI, dimensions, and reverse search links."""
+    path_or_url = str(path_or_url).strip()
+    is_url = path_or_url.startswith("http://") or path_or_url.startswith("https://")
+    blob = None
+    filename = ""
+
+    if is_url:
+        filename = posixpath.basename(urllib.parse.urlsplit(path_or_url).path) or path_or_url
+        try:
+            if not _fetch_target_ok(path_or_url):
+                return {"error": "not a public http(s) host", "source": path_or_url, "filename": filename}
+            import requests
+            _opsec("target_hosts", _host(path_or_url))
+            r = requests.get(path_or_url, headers={"User-Agent": BROWSER_UA},
+                             timeout=timeout, proxies=PROXIES, stream=True)
+            if r.status_code == 200:
+                blob = _read_capped(r, 8_000_000)
+            else:
+                r.close()
+                return {"error": f"HTTP {r.status_code}", "source": path_or_url, "filename": filename}
+        except Exception as e:
+            return {"error": f"fetch failed: {type(e).__name__}", "source": path_or_url, "filename": filename}
+    else:
+        p = pathlib.Path(path_or_url).expanduser().resolve()
+        filename = p.name
+        if not p.exists():
+            return {"error": f"file not found: {p}", "source": path_or_url, "filename": filename}
+        try:
+            sz = p.stat().st_size
+            if sz > 15_000_000:
+                return {"error": f"file exceeds 15MB limit ({sz} bytes)", "source": path_or_url, "filename": filename}
+            blob = p.read_bytes()
+        except Exception as e:
+            return {"error": f"read error: {type(e).__name__}", "source": path_or_url, "filename": filename}
+
+    if blob is None:
+        return {"error": "empty image data", "source": path_or_url, "filename": filename}
+
+    try:
+        import warnings
+        from PIL import Image as _I
+        _I.MAX_IMAGE_PIXELS = 40_000_000
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", _I.DecompressionBombWarning)
+            im = _I.open(io.BytesIO(blob))
+            im.load()
+        w, h = im.size
+        sha = hashlib.sha256(blob).hexdigest()
+
+        hsh_d = _dhash(im)
+        hsh_p = _phash(im)
+        # Center crop (85% inner area)
+        cw, ch = max(16, int(w * 0.85)), max(16, int(h * 0.85))
+        cx, cy = (w - cw) // 2, (h - ch) // 2
+        im_center = im.crop((cx, cy, cx + cw, cy + ch))
+        hsh_dc = _dhash(im_center)
+        hsh_pc = _phash(im_center)
+
+        is_gen = _is_generated_avatar(im)
+        hashes = {
+            "dhash": hsh_d,
+            "dhash_center": hsh_dc,
+            "phash": hsh_p,
+            "phash_center": hsh_pc,
+        }
+        im_thumb = im.convert("RGB")
+        im_thumb.thumbnail((px, px), _I.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        im_thumb.save(buf, "JPEG", quality=82)
+        data_uri = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+
+        rev_links = reverse_image_links(path_or_url) if is_url else local_image_search_links()
+        hd_file = _save_image(sha, _jpeg_copy(im, 640, 88))
+
+        return {
+            "source": path_or_url,
+            "filename": filename,
+            "is_url": is_url,
+            "hd_file": hd_file,
+            "sha256": sha,
+            "avatar_sha256": sha,
+            "avatar_hash": f"{hsh_d:016x}",
+            "avatar_hashes": hashes,
+            "avatar_is_generated": is_gen,
+            "thumb": data_uri,
+            "dimensions": f"{w}×{h}",
+            "reverse_links": rev_links,
+            "matches": [],
+        }
+    except Exception as e:
+        return {"error": f"image decode failed: {type(e).__name__}", "source": path_or_url, "filename": filename}
+
+def match_target_images_against_accounts(target_images, accounts, max_dist=6, max_phash=8):
+    """Compare operator-supplied target images against verified accounts' avatars and covers.
+    Populates target_image['matches'] with matched account summaries."""
+    for timg in target_images:
+        if not timg or timg.get("error"):
+            continue
+        matches = []
+        for acc in accounts:
+            if not acc:
+                continue
+            # Compare with avatar
+            if acc.get("avatar_hash") or acc.get("avatar_sha256"):
+                matched, tier = _images_match(timg, acc, max_dhash=max_dist, max_phash=max_phash)
+                if matched:
+                    matches.append({
+                        "site": acc.get("site") or "?",
+                        "user": acc.get("user") or "",
+                        "url": acc.get("url") or "",
+                        "display_name": acc.get("display_name") or "",
+                        "tier": tier,
+                        "avatar": acc.get("avatar") or "",
+                        "avatar_src": acc.get("avatar_src") or "",
+                        "kind": "avatar",
+                    })
+                    acc["target_image_match"] = tier
+                    continue
+            # Compare with cover if cover has sha256
+            if acc.get("cover_sha256") and acc["cover_sha256"] == timg.get("sha256"):
+                matches.append({
+                    "site": acc.get("site") or "?",
+                    "user": acc.get("user") or "",
+                    "url": acc.get("url") or "",
+                    "display_name": acc.get("display_name") or "",
+                    "tier": "strong",
+                    "avatar": acc.get("cover_thumb") or "",
+                    "avatar_src": acc.get("cover_url") or "",
+                    "kind": "cover",
+                })
+                acc["target_image_match"] = "strong"
+        timg["matches"] = matches
+
+MATCH_TIER_ORDER = {"strong": 0, "face": 1, "possible": 2, "similar": 3}
+
+def stage_vision(findings, accounts, faces=False, clip=False, threshold=0.5, base=None):
+    """Local face / CLIP analysis over the captured pictures (ml/vision.py in its own venv).
+
+    `accounts` is the exact list vision.py indexes as acct:<i>, so merge_vision must get
+    the same list. Nothing leaves the machine; the models are read from ml/models."""
+    if not (faces or clip):
+        return {"status": "skipped", "reason": "not requested (--faces / --clip)"}
+    if not ML_PY.exists():
+        return {"status": "skipped", "reason": "local vision stack missing (dashboard/install-ml.sh)"}
+    if faces and not (OSINT / "ml" / "models" / "models" / "buffalo_l").is_dir():
+        return {"status": "skipped", "reason": "face model not downloaded yet (ml/.venv/bin/python ml/vision.py warmup)"}
+    doc = {"target_images": findings.get("target_images") or [], "accounts": accounts,
+           "metadata": findings.get("metadata") or []}
+    cmd = [str(ML_PY), str(VISION_PY), "analyze", "-", "--threshold", str(threshold)]
+    if base:
+        cmd += ["--base", str(base)]
+    if faces:
+        cmd.append("--faces")
+    if clip:
+        cmd.append("--clip")
+    try:
+        p = subprocess.run(cmd, input=json.dumps(doc, default=str), capture_output=True,
+                           text=True, timeout=1800)
+    except Exception as e:
+        return {"status": "failed", "reason": type(e).__name__}
+    try:
+        res = json.loads(p.stdout)
+    except ValueError:
+        return {"status": "failed", "reason": _redact((p.stderr or "no output").strip()[-300:])}
+    if res.get("error"):
+        return {"status": "failed", "reason": res["error"][:300]}
+    res["status"] = "ran"
+    res["flags"] = {"faces": faces, "clip": clip}
+    return res
+
+def _add_match(ti, acc, tier, kind, score):
+    """Record a vision match on a target image; an existing hash match only gains the score."""
+    for m in ti.setdefault("matches", []):
+        if m.get("url") == acc.get("url"):
+            # several faces in one picture yield several pairs; keep the best per kind
+            m[f"{kind}_score"] = max(m.get(f"{kind}_score") or 0, score)
+            if MATCH_TIER_ORDER.get(tier, 9) < MATCH_TIER_ORDER.get(m.get("tier"), 9):
+                m["tier"], m["kind"], m["score"] = tier, kind, score
+            return
+    ti["matches"].append({"site": acc.get("site") or "?", "user": acc.get("user") or "",
+                          "url": acc.get("url") or "", "display_name": acc.get("display_name") or "",
+                          "tier": tier, "kind": kind, "score": score,
+                          "avatar": acc.get("avatar") or "", "avatar_src": acc.get("avatar_src") or ""})
+
+def merge_vision(findings, res, accounts):
+    """Fold vision.py output into target-image matches, account rows and face clusters."""
+    if res.get("status") != "ran":
+        return
+    tis = findings.get("target_images") or []
+
+    def _acct(key):
+        kind, _, idx = key.partition(":")
+        if kind in ("acct", "cover") and idx.isdigit() and int(idx) < len(accounts):
+            return accounts[int(idx)]
+        return None
+
+    def _target(key):
+        kind, _, idx = key.partition(":")
+        if kind == "target" and idx.isdigit() and int(idx) < len(tis):
+            return tis[int(idx)]
+        return None
+
+    parent = {}
+    def find(k):
+        while parent.setdefault(k, k) != k:
+            k = parent[k]
+        return k
+    for m in res.get("face_matches") or []:
+        for ka, kb in ((m["a"], m["b"]), (m["b"], m["a"])):
+            ti, acc = _target(ka), _acct(kb)
+            if ti is not None and acc is not None:
+                _add_match(ti, acc, "face", "face", m["score"])
+                acc["face_match"] = max(acc.get("face_match") or 0, m["score"])
+                acc["target_image_match"] = acc.get("target_image_match") or "face"
+        a, b = _acct(m["a"]), _acct(m["b"])
+        if a is not None and b is not None and _host(a.get("url")) != _host(b.get("url")):
+            parent[find(id(a))] = find(id(b))
+    for m in res.get("clip_similar") or []:
+        ti, acc = _target(m["a"]), _acct(m["b"])
+        if ti is not None and acc is not None:
+            _add_match(ti, acc, "similar", "clip", m["score"])
+    for ti in tis:
+        (ti.get("matches") or []).sort(key=lambda m: (MATCH_TIER_ORDER.get(m.get("tier"), 9), -(m.get("score") or 0)))
+
+    by_root = {}
+    for acc in accounts:
+        if id(acc) in parent:
+            by_root.setdefault(find(id(acc)), []).append(acc)
+    groups = []
+    for members in by_root.values():
+        if len({_host(x.get("url")) for x in members}) < 2:
+            continue
+        keys = {id(x) for x in members}
+        scores = [m["score"] for m in res.get("face_matches") or []
+                  if id(_acct(m["a"]) or 0) in keys and id(_acct(m["b"]) or 0) in keys]
+        groups.append({"members": [{"site": x.get("site"), "user": x.get("user"), "url": x.get("url"),
+                                    "avatar": x.get("avatar") or ""} for x in members],
+                       "min_score": min(scores) if scores else None,
+                       "max_score": max(scores) if scores else None})
+    groups.sort(key=lambda g: -(g["max_score"] or 0))
+    for i, g in enumerate(groups, 1):
+        for acc in accounts:
+            if any(acc.get("url") == x["url"] for x in g["members"]):
+                acc["face_group"] = i
+    findings["face_groups"] = groups
 
 _SCRIPT_RE = re.compile(r"<(script|style|template|noscript)\b[^>]*>.*?</\1>", re.I | re.S)
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -1625,6 +1905,9 @@ def verify_account(acc, fetch_avatar=True, timeout=15):
         out["avatar"], out["avatar_hash"], out["avatar_src"], out["avatar_sha256"] = thumb_res
         out["avatar_hashes"] = getattr(thumb_res, "hashes", {})
         out["avatar_is_generated"] = getattr(thumb_res, "is_generated", False)
+        hd_file = _save_image(out.get("avatar_sha256"), getattr(thumb_res, "hd", b""))
+        if hd_file:
+            out["avatar_file"] = hd_file
         cover = getattr(thumb_res, "cover", {})
         if cover.get("url"):
             out["cover_url"] = cover["url"]
@@ -1873,6 +2156,15 @@ def main():
     ap.add_argument("--no-avatars", action="store_true", help="verify accounts but do not embed profile pictures")
     ap.add_argument("--verify-workers", type=int, default=8, help="parallel requests used while verifying accounts")
     ap.add_argument("--no-instagram", action="store_true", help="skip the Instagram profile lookup (instaloader)")
+    ap.add_argument("-i", "--image", action="append", default=[],
+                    help="target reference image path or URL for visual matching & reverse search")
+    ap.add_argument("--faces", action="store_true",
+                    help="compare faces across the captured pictures with the local InsightFace model "
+                         "(biometric processing: opt-in, needs dashboard/install-ml.sh)")
+    ap.add_argument("--clip", action="store_true",
+                    help="CLIP visual similarity between reference images and captured pictures (local)")
+    ap.add_argument("--face-threshold", type=float, default=0.5,
+                    help="cosine similarity a face pair must reach to count as a match (default 0.5)")
     ap.add_argument("--no-lockdown", action="store_true",
                     help="do not enable Mullvad lockdown mode for the duration of the scan")
     args = ap.parse_args()
@@ -1921,6 +2213,11 @@ def main():
             print(_c("1;33", "        Mullvad lockdown is OFF: if the VPN drops mid-scan, traffic continues over your ISP."))
 
     prof = parse_target(tpath)
+    global IMAGES_DIR
+    IMAGES_DIR = tpath.parent / "images"
+    for img in args.image:
+        if img and img not in prof.get("image", []):
+            prof.setdefault("image", []).append(img)
     prof["_derived"] = []
     prof["_derived_emails"] = []     # addresses the scan discovered, kept apart from the input
     prof["_depth_used"] = args.depth
@@ -1938,11 +2235,29 @@ def main():
     head(f"=== KARGU-OSINT scan started: {tpath.name} @ {ts} ===")
     print(f"Input -> username:{len(prof['username'])} email:{len(prof['email'])} "
           f"phone:{len(prof['phone'])} domain:{len(prof['domain'])} file:{len(prof['file'])} "
+          f"image:{len(prof.get('image', []))} "
           f"{'[TOR]' if args.tor else ''}")
     print(f"API keys active: {', '.join(active) if (active and use_api) else 'none'}\n")
 
     findings = {"target_file": str(tpath), "timestamp": ts, "input": prof, "api_keys_active": active if use_api else [],
-                "identity": {}, "email": {}, "domain": {}, "phone": [], "metadata": [], "deep": None}
+                "identity": {}, "email": {}, "domain": {}, "phone": [], "metadata": [], "deep": None,
+                "target_images": []}
+
+    target_images = []
+    all_img_sources = list(prof.get("image", []))
+    img_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
+    for f in prof.get("file", []):
+        if pathlib.Path(f).suffix.lower() in img_exts and f not in all_img_sources:
+            all_img_sources.append(f)
+    for img_src in all_img_sources:
+        step(f"[VISUAL] loading target reference image: {img_src}")
+        ti = process_target_image(img_src)
+        if ti.get("error"):
+            warn(f"target image ({img_src}): {ti['error']}")
+        else:
+            ok(f"target image ready ({ti.get('dimensions', '?')}, sha256:{ti.get('sha256', '')[:12]}…)")
+        target_images.append(ti)
+    findings["target_images"] = target_images
 
     seen_users = set(u.lower() for u in prof["username"])
     seen_emails = set(e.lower() for e in prof["email"])
@@ -2180,14 +2495,124 @@ def main():
     OPSEC_LOG["tools"] = sorted(tools)
     findings["opsec"] = {k: (dict(v) if isinstance(v, dict) else v) for k, v in OPSEC_LOG.items()}
 
+    # ---------------- VISUAL INTELLIGENCE MATCHING & SUMMARY ----------------
+    target_imgs = [ti for ti in (findings.get("target_images") or []) if not ti.get("error")]
+    ver_accs = [v for v in (findings.get("verified") or []) if v.get("state") == "verified"]
+    if target_imgs and ver_accs:
+        match_target_images_against_accounts(target_imgs, ver_accs)
+    if args.faces or args.clip:
+        step("[VISUAL] local vision stage (faces / CLIP) ...")
+    vis = stage_vision(findings, ver_accs, faces=args.faces, clip=args.clip,
+                       threshold=args.face_threshold, base=tpath.parent)
+    findings["vision"] = vis
+    merge_vision(findings, vis, ver_accs)
+
+    head("=== VISUAL RESULTS ===")
+    print(_c("1;36", "─── 1. OPERATOR REFERENCE IMAGES ───"))
+    if findings.get("target_images"):
+        for ti in findings["target_images"]:
+            if ti.get("error"):
+                warn(f"{ti.get('filename')}: {ti['error']}")
+                continue
+            matches = ti.get("matches", [])
+            if matches:
+                ok(f"{ti.get('filename')}: matched {len(matches)} account(s) — "
+                   + ", ".join(f"{m['site']} ({m['tier']}" + (f" {m['score']:.2f}" if m.get("score") else "") + ")"
+                               for m in matches))
+            else:
+                log(f"  {ti.get('filename')}: no profile picture match among the scanned accounts")
+    else:
+        log("  no reference image given (image: /path/to/photo.jpg in the target file, or -i)")
+
+    print(_c("1;36", "─── 2. AUTO-DISCOVERED VISUAL CLUSTERS ───"))
+    pgs = group_by_photo(findings.get("verified") or [])
+    if pgs:
+        for i, g in enumerate(pgs, 1):
+            ok(f"same profile photo #{i} [{g.get('tier', 'possible')}] on {len(g['members'])} sites: "
+               + ", ".join(m.get("site") or "?" for m in g["members"]))
+    else:
+        log("  no shared profile picture among the scanned accounts")
+
+    print(_c("1;36", "─── 3. LOCAL VISION (InsightFace / CLIP) ───"))
+    if vis.get("status") == "ran":
+        ran = vis.get("ran") or {}
+        if ran.get("faces"):
+            ok(f"faces: {vis.get('faces_total', 0)} face(s) in {len(vis.get('images') or [])} picture(s), "
+               f"{len(vis.get('face_matches') or [])} cross-account pair(s) >= {vis.get('threshold')}")
+            for i, g in enumerate(findings.get("face_groups") or [], 1):
+                ok(f"same face #{i} (cosine {g['min_score']:.2f}-{g['max_score']:.2f}): "
+                   + ", ".join(m.get("site") or "?" for m in g["members"]))
+        if ran.get("clip"):
+            ok(f"CLIP: {len(vis.get('clip_similar') or [])} reference/captured pair(s) look alike")
+    else:
+        log(f"  {vis.get('status')}: {vis.get('reason')}")
+    print()
+
     update_target(tpath, findings, ts)
     hpath = write_html_report(findings, tpath, ts)
+    jpath = write_json_export(findings, tpath, ts)
 
     head("=== DONE ===")
     print(f"Folder : {tpath.parent}")
     print(f"Profile: {tpath.name}   (findings appended at the end)")
     print(f"Report : {hpath.name}")
+    print(f"Data   : {jpath.name}   (machine-readable, feeds the dashboard)")
     print(_c("1;32", f"\nOpen it:  xdg-open {hpath}"))
+
+# ---------------- JSON export ----------------
+def _geo_points(findings):
+    """Everything with a coordinate or a country, for the map panel."""
+    pts = []
+    for m in findings.get("metadata") or []:
+        sm = (m.get("meta") or {}).get("_summary") or {}
+        lat, lon = sm.get("GPSLatitude"), sm.get("GPSLongitude")
+        if lat is not None and lon is not None:
+            try:
+                pts.append({"kind": "exif", "lat": float(lat), "lon": float(lon),
+                            "label": os.path.basename(m.get("file") or ""),
+                            "when": sm.get("DateTime") or "", "source": "exiftool"})
+            except (TypeError, ValueError):
+                pass
+    for p in findings.get("phone") or []:
+        nv = p.get("numverify") or {}
+        if nv.get("country_code"):
+            pts.append({"kind": "phone", "country": nv["country_code"],
+                        "label": p.get("number") or "", "detail": nv.get("location") or "",
+                        "source": "numverify"})
+    eg = (findings.get("opsec") or {}).get("egress") or {}
+    if eg.get("ip"):
+        pts.append({"kind": "egress", "country": eg.get("country") or "", "city": eg.get("city") or "",
+                    "label": eg.get("ip"), "source": "am.i.mullvad.net"})
+    for e, r in (findings.get("email") or {}).items():
+        gv = r.get("gravatar") or {}
+        if gv.get("location"):
+            pts.append({"kind": "gravatar", "label": e, "detail": gv["location"], "source": "gravatar"})
+    return pts
+
+def _seeds(findings):
+    """Search keys the other panels pivot on."""
+    inp = findings.get("input") or {}
+    names = sorted({v.get("display_name") for v in findings.get("verified") or []
+                    if v.get("state") == "verified" and v.get("display_name")})
+    return {"names": list(inp.get("name") or []) + names,
+            "usernames": list(inp.get("username") or []),
+            "emails": list(inp.get("email") or []) + list(inp.get("_derived_emails") or []),
+            "phones": list(inp.get("phone") or []),
+            "domains": list(inp.get("domain") or [])}
+
+def write_json_export(findings, tpath, ts):
+    """<case>.json next to the .txt/.html: the same findings dict, plus derived sections
+    the dashboard reads directly (geo points, pivot seeds, per-account states)."""
+    doc = dict(findings)
+    doc["schema"] = "kargu-case/1"
+    doc["generated"] = ts
+    doc["stats"] = _stats(findings)
+    doc["geo"] = _geo_points(findings)
+    doc["seeds"] = _seeds(findings)
+    doc["accounts"] = _accounts(findings)
+    J = tpath.with_suffix(".json")
+    J.write_text(json.dumps(doc, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+    return J
 
 # ---------------- summaries ----------------
 def _acct_key(url, site=""):
@@ -2281,6 +2706,12 @@ def update_target(tpath, findings, ts):
             nm = f" | name={a['display_name']}" if a.get("display_name") else ""
             lines.append(f"found_account: {tag}{a['site']} | {a['url']} | user={a['user']} "
                          f"| ({','.join(a.get('via') or [])}){nm}")
+    for ti in (findings.get("target_images") or []):
+        for m in ti.get("matches", []):
+            sc = f" {m['score']:.2f}" if m.get("score") else ""
+            lines.append(f"matched_target_image: [{m.get('tier', 'possible')}{sc}] {m.get('site')} | {m.get('url')} | user={m.get('user')} (matched {ti.get('filename')})")
+    for i, g in enumerate(findings.get("face_groups") or [], 1):
+        lines.append(f"same_face: #{i} | " + " | ".join(f"{x.get('site')} {x.get('url')}" for x in g["members"]))
     for e, r in findings["email"].items():
         used = r.get("holehe", {}).get("used", [])
         if used:
@@ -2411,10 +2842,10 @@ def write_html_report(findings, tpath, ts):
 
     # 1 input
     a("<h2>1 · Input</h2><div class='box'><div class='kv'>")
-    labels = {"name": "Name", "email": "E-mail", "phone": "Phone", "domain": "Domain", "file": "File", "notes": "Notes"}
+    labels = {"name": "Name", "email": "E-mail", "phone": "Phone", "domain": "Domain", "file": "File", "image": "Target Image", "notes": "Notes"}
     found_mail = set(inp.get("_derived_emails") or [])
     csrc = findings.get("correlation_sources") or {}
-    for k in ("name", "email", "phone", "domain", "file", "notes"):
+    for k in ("name", "email", "phone", "domain", "file", "image", "notes"):
         if not inp.get(k):
             continue
         if k == "email":
@@ -2437,20 +2868,108 @@ def write_html_report(findings, tpath, ts):
           f"<span class='mut'>— generated from the name / e-mail</span></div>")
     a("</div></div>")
 
-    # 2 accounts
-    if st["did_verify"]:
-        names, bios, mails = {}, [], set()
-        for r in accounts:
-            if r.get("state") != "verified":
-                continue
-            if r.get("display_name"):
-                names.setdefault(r["display_name"], []).append(r.get("site") or "")
-            if r.get("description"):
-                bios.append((r.get("site") or "", r["description"]))
-            mails |= set(r.get("emails") or [])
-        photo_groups = group_by_photo(accounts)
-        if names or bios or photo_groups:
-            a("<h2>2 · Who this is (pulled from the live profiles)</h2><div class='box'><div class='kv'>")
+    # 2 accounts & visual intelligence
+    target_imgs = [ti for ti in (findings.get("target_images") or []) if not ti.get("error")]
+    target_img_errors = [ti for ti in (findings.get("target_images") or []) if ti.get("error")]
+    has_target_visuals = bool(target_imgs or target_img_errors or inp.get("image"))
+
+    names, bios, mails = {}, [], set()
+    for r in accounts:
+        if r.get("state") != "verified":
+            continue
+        if r.get("display_name"):
+            names.setdefault(r["display_name"], []).append(r.get("site") or "")
+        if r.get("description"):
+            bios.append((r.get("site") or "", r["description"]))
+        mails |= set(r.get("emails") or [])
+    photo_groups = group_by_photo(accounts) if st["did_verify"] else []
+
+    if st["did_verify"] or has_target_visuals:
+        a("<h2>2 · Visual & Identity Intelligence</h2>")
+
+        # 2.1 operator reference images
+        a("<div class='box' style='margin-bottom:16px'>")
+        a("<div style='font-size:14px;font-weight:600;margin-bottom:10px;color:var(--accent);font-family:ui-monospace,SFMono-Regular,Menlo,monospace'>"
+          "2.1 · Operator reference images</div>")
+        if target_imgs:
+            a("<div class='kv'>")
+            for ti in target_imgs:
+                fn = ti.get("filename") or ti.get("source")
+                t_src = ti.get("source")
+                dim = ti.get("dimensions", "")
+                sha = ti.get("sha256", "")
+                matches = ti.get("matches") or []
+
+                thumb_html = (f"<img src='{_img(ti.get('thumb'))}' style='max-width:96px;max-height:96px;border-radius:6px;"
+                              f"border:1px solid var(--line);vertical-align:top;margin-right:12px;float:left'>" if ti.get("thumb") else "")
+                info_html = (f"<div>{thumb_html}<div>"
+                             f"<b>{_e(fn)}</b>"
+                             + (f" <span class='mut'>({_e(dim)})</span>" if dim else "")
+                             + f"<br><span class='mut' style='font-size:11px'>SHA-256: <code>{_e(sha[:16])}…</code></span>"
+                             + (f"<br><span class='mut' style='font-size:11px'>Source: {_e(t_src[:60])}</span>" if ti.get("is_url") else "")
+                             + "</div><div style='clear:both'></div></div>")
+                a(f"<div>Reference Image</div>{info_html}")
+
+                if matches:
+                    m_bits = []
+                    for m in matches:
+                        tier, score = m.get("tier"), m.get("score") or 0
+                        if tier == "strong":
+                            tag_cls, tag_txt = "ok", "strong match (byte-identical)"
+                        elif tier == "face":
+                            tag_cls, tag_txt = ("ok" if score >= FACE_STRONG else "warn"), f"face match (cosine {score:.2f})"
+                        elif tier == "similar":
+                            tag_cls, tag_txt = "warn", f"visually similar (CLIP {score:.2f})"
+                        else:
+                            tag_cls, tag_txt = "warn", "possible match (perceptual)"
+                        av_html = (f"<img class='av' style='display:inline-block;vertical-align:middle;margin-right:6px;width:28px;height:28px' "
+                                   f"src='{_img(m.get('avatar'))}' alt=''>" if m.get("avatar") else "")
+                        site_link = f"<a href='{_href(m.get('url'))}' target='_blank' rel='noopener'><b>{_e(m.get('site'))}</b></a>"
+                        user_str = f" @{_e(m.get('user'))}" if m.get("user") else ""
+                        name_str = f" ({_e(m.get('display_name'))})" if m.get("display_name") else ""
+                        kind_str = f" [{_e(m.get('kind'))}]" if m.get("kind") == "cover" else ""
+                        m_bits.append(f"<div style='margin-bottom:6px'>{av_html}{site_link}{user_str}{name_str}{kind_str} "
+                                      f"<span class='tag {tag_cls}'>{tag_txt}</span></div>")
+                    a(f"<div>Matched Accounts <span class='tag ok'>{len(matches)} match(es)</span></div><div>{''.join(m_bits)}</div>")
+                else:
+                    a("<div>Matched Accounts</div><div><span class='mut'>No direct photo match found in scanned profile avatars. "
+                      "Use the reverse image search links below to discover web footprint.</span></div>")
+
+                rev_links = ti.get("reverse_links") or []
+                if rev_links:
+                    r_html = " · ".join(f"<a href='{_href(u)}' target='_blank' rel='noopener'>{_e(n)}</a>" for n, u in rev_links)
+                    note = ("Opens reverse search query at target engine" if ti.get("is_url")
+                            else "Upload / drag-and-drop your local file into the search engine portal")
+                    a(f"<div>Reverse Image Search</div><div>{r_html}<br><span class='mut'>{note}</span></div>")
+            a("</div>")
+        elif target_img_errors:
+            a("<div class='kv'>")
+            for err in target_img_errors:
+                a(f"<div>Reference Image Error</div><div><span class='tag warn'>{_e(err.get('filename'))}</span>: {_e(err.get('error'))}</div>")
+            a("</div>")
+        else:
+            a("<div class='mut' style='padding:4px 0'>No reference image provided. "
+              "Add <code>image: /path/to/target.jpg</code> (or URL) to your target profile, "
+              "or pass <code>--image &lt;path&gt;</code> on the command line to match against discovered accounts.</div>")
+        vis = findings.get("vision") or {}
+        a("<div class='kv'>")
+        if vis.get("status") == "ran":
+            eng = " · ".join(f"{k}: {_e(v)}" for k, v in (vis.get("engine") or {}).items())
+            a(f"<div>Local vision</div><div>{vis.get('faces_total', 0)} face(s) found in "
+              f"{len(vis.get('images') or [])} picture(s), face threshold {_e(vis.get('threshold'))}"
+              f"<br><span class='mut'>{eng}. Runs on this machine only; cosine similarity is not identity — "
+              "biometric processing needs a lawful basis (KVKK art. 6 / GDPR art. 9).</span></div>")
+        else:
+            a(f"<div>Local vision</div><div><span class='mut'>not run — {_e(vis.get('reason') or 'no vision stage')}. "
+              "Add <code>--faces</code> / <code>--clip</code> (needs <code>dashboard/install-ml.sh</code>).</span></div>")
+        a("</div></div>")
+
+        # 2.2 pictures the scan found by itself
+        a("<div class='box'>")
+        a("<div style='font-size:14px;font-weight:600;margin-bottom:10px;color:var(--accent);font-family:ui-monospace,SFMono-Regular,Menlo,monospace'>"
+          "2.2 · Auto-discovered profile visuals &amp; identity</div>")
+        a("<div class='kv'>")
+        if photo_groups:
             for g in photo_groups:
                 sites = ", ".join(m.get("site") or "?" for m in g["members"])
                 thumb = next((m.get("avatar") for m in g["members"] if m.get("avatar")), "")
@@ -2465,56 +2984,71 @@ def write_html_report(findings, tpath, ts):
                   f"{'strong' if strong else 'possible'}</span></div><div>"
                   + (f"<img class='av' style='display:inline-block;vertical-align:middle;margin-right:8px' src='{_img(thumb)}' alt=''>" if thumb else "")
                   + f"<b>{len(g['members'])} accounts</b> {claim} — {_e(sites)} " + why + "</div>")
-            if names:
-                a("<div>Names on the profiles</div><div>" + "<br>".join(
-                    f"<b>{_e(n)}</b> <span class='mut'>— {_e(', '.join(sorted(set(v))))}</span>"
-                    for n, v in sorted(names.items(), key=lambda kv: -len(kv[1]))) + "</div>")
-            if mails:
-                a(f"<div>E-mails shown publicly</div><div>{_e(', '.join(sorted(mails)))}</div>")
-            # One block per distinct picture, keyed on sha256 rather than URL: github.com
-            # and gist.github.com serve the same file from different addresses.
-            by_pic = {}
-            for r in accounts:
-                src = r.get("avatar_src")
-                if not src:
-                    continue
-                k = r.get("avatar_sha256") or src
-                by_pic.setdefault(k, {"src": src, "sites": []})["sites"].append(r.get("site") or "?")
-            for pic in by_pic.values():
-                links = " · ".join(f"<a href='{_href(u)}' target='_blank' rel='noopener'>{_e(n)}</a>"
-                                   for n, u in reverse_image_links(pic["src"]))
-                where = ", ".join(sorted(set(pic["sites"])))
-                a(f"<div>Reverse image search<br><span class='mut'>({_e(where)} photo)</span></div>"
-                  f"<div>{links}<br><span class='mut'>Opens the picture at a search engine — "
-                  f"this leaves your query with that engine, not with the target.</span></div>")
-            by_cover = {}
-            for r in accounts:
-                csrc = r.get("cover_url")
-                if not csrc:
-                    continue
-                by_cover.setdefault(csrc, {"src": csrc, "thumb": r.get("cover_thumb"), "sites": []})["sites"].append(r.get("site") or "?")
-            for cov in by_cover.values():
-                links = " · ".join(f"<a href='{_href(u)}' target='_blank' rel='noopener'>{_e(n)}</a>"
-                                   for n, u in reverse_image_links(cov["src"]))
-                where = ", ".join(sorted(set(cov["sites"])))
-                cov_img = f"<img src='{_img(cov['thumb'])}' style='max-height:42px;vertical-align:middle;margin-right:8px;border-radius:4px;border:1px solid #444'>" if cov.get("thumb") else ""
-                a(f"<div>Reverse image search<br><span class='mut'>({_e(where)} cover)</span></div>"
-                  f"<div>{cov_img}{links}<br><span class='mut'>Opens the profile banner/cover at a search engine — "
-                  f"useful for identifying event photos or corporate branding.</span></div>")
-            for u, ig in (findings.get("instagram") or {}).items():
-                if not ig.get("ok"):
-                    continue
-                bits = [f"<b>{_e(ig.get('full_name') or u)}</b>",
-                        f"{ig.get('followers')} followers", f"{ig.get('followees')} following"]
-                if ig.get("is_private"):  bits.append("<span class='tag warn'>private</span>")
-                if ig.get("is_verified"): bits.append("<span class='tag ok'>verified</span>")
-                if ig.get("is_business"): bits.append(f"business: {_e(ig.get('business_category') or '—')}")
-                if ig.get("external_url"):
-                    bits.append(f"<a href='{_href(ig['external_url'])}' target='_blank' rel='noopener'>{_e(ig['external_url'])}</a>")
-                a(f"<div>Instagram @{_e(u)}</div><div>" + " · ".join(bits) + "</div>")
-            for site, b in bios[:8]:
-                a(f"<div>{_e(site)} bio</div><div>{_e(b[:300])}</div>")
-            a("</div></div>")
+        else:
+            a("<div>Profile Photo Groups</div><div><span class='mut'>No cross-platform photo clusters identified among scanned profiles.</span></div>")
+        for i, g in enumerate(findings.get("face_groups") or [], 1):
+            strong = (g.get("min_score") or 0) >= FACE_STRONG
+            pics = "".join(f"<img class='av' style='display:inline-block;vertical-align:middle;margin-right:4px' "
+                           f"src='{_img(x['avatar'])}' alt=''>" for x in g["members"] if x.get("avatar"))
+            sites = ", ".join(f"<a href='{_href(x.get('url'))}' target='_blank' rel='noopener'>{_e(x.get('site'))}</a>"
+                              for x in g["members"])
+            lo, hi = f"{g.get('min_score') or 0:.2f}", f"{g.get('max_score') or 0:.2f}"
+            a(f"<div>Same face #{i} <span class='tag {'ok' if strong else 'warn'}'>cosine {lo}–{hi}</span></div>"
+              f"<div>{pics}<b>{len(g['members'])} accounts</b> show the same face — {sites} "
+              "<span class='mut'>(local InsightFace embedding; a high score means the faces look alike, "
+              "which is strong but not conclusive same-person evidence)</span></div>")
+
+        if names:
+            a("<div>Names on the profiles</div><div>" + "<br>".join(
+                f"<b>{_e(n)}</b> <span class='mut'>— {_e(', '.join(sorted(set(v))))}</span>"
+                for n, v in sorted(names.items(), key=lambda kv: -len(kv[1]))) + "</div>")
+        if mails:
+            a(f"<div>E-mails shown publicly</div><div>{_e(', '.join(sorted(mails)))}</div>")
+
+        by_pic = {}
+        for r in accounts:
+            src = r.get("avatar_src")
+            if not src:
+                continue
+            k = r.get("avatar_sha256") or src
+            by_pic.setdefault(k, {"src": src, "sites": []})["sites"].append(r.get("site") or "?")
+        for pic in by_pic.values():
+            links = " · ".join(f"<a href='{_href(u)}' target='_blank' rel='noopener'>{_e(n)}</a>"
+                               for n, u in reverse_image_links(pic["src"]))
+            where = ", ".join(sorted(set(pic["sites"])))
+            a(f"<div>Reverse image search<br><span class='mut'>({_e(where)} photo)</span></div>"
+              f"<div>{links}<br><span class='mut'>Opens the picture at a search engine — "
+              f"this leaves your query with that engine, not with the target.</span></div>")
+
+        by_cover = {}
+        for r in accounts:
+            csrc = r.get("cover_url")
+            if not csrc:
+                continue
+            by_cover.setdefault(csrc, {"src": csrc, "thumb": r.get("cover_thumb"), "sites": []})["sites"].append(r.get("site") or "?")
+        for cov in by_cover.values():
+            links = " · ".join(f"<a href='{_href(u)}' target='_blank' rel='noopener'>{_e(n)}</a>"
+                               for n, u in reverse_image_links(cov["src"]))
+            where = ", ".join(sorted(set(cov["sites"])))
+            cov_img = f"<img src='{_img(cov['thumb'])}' style='max-height:42px;vertical-align:middle;margin-right:8px;border-radius:4px;border:1px solid #444'>" if cov.get("thumb") else ""
+            a(f"<div>Reverse image search<br><span class='mut'>({_e(where)} cover)</span></div>"
+              f"<div>{cov_img}{links}<br><span class='mut'>Opens the profile banner/cover at a search engine — "
+              f"useful for identifying event photos or corporate branding.</span></div>")
+
+        for u, ig in (findings.get("instagram") or {}).items():
+            if not ig.get("ok"):
+                continue
+            bits = [f"<b>{_e(ig.get('full_name') or u)}</b>",
+                    f"{ig.get('followers')} followers", f"{ig.get('followees')} following"]
+            if ig.get("is_private"):  bits.append("<span class='tag warn'>private</span>")
+            if ig.get("is_verified"): bits.append("<span class='tag ok'>verified</span>")
+            if ig.get("is_business"): bits.append(f"business: {_e(ig.get('business_category') or '—')}")
+            if ig.get("external_url"):
+                bits.append(f"<a href='{_href(ig['external_url'])}' target='_blank' rel='noopener'>{_e(ig['external_url'])}</a>")
+            a(f"<div>Instagram @{_e(u)}</div><div>" + " · ".join(bits) + "</div>")
+        for site, b in bios[:8]:
+            a(f"<div>{_e(site)} bio</div><div>{_e(b[:300])}</div>")
+        a("</div></div>")
 
     a("<h2>3 · Accounts found</h2>")
     if accounts:
@@ -2546,6 +3080,10 @@ def write_html_report(findings, tpath, ts):
                 ptier = r.get("photo_tier") or "possible"
                 cell += (f" <span class='tag {'ok' if ptier == 'strong' else 'warn'}'>"
                          f"photo #{r['photo_group']} {_e(ptier)}</span>")
+            if r.get("face_group"):
+                cell += f" <span class='tag ok'>face #{r['face_group']}</span>"
+            if r.get("face_match"):
+                cell += f" <span class='tag {'ok' if r['face_match'] >= FACE_STRONG else 'warn'}'>ref face {r['face_match']:.2f}</span>"
             arc = r.get("archive") or {}
             if arc.get("existed"):
                 cell += (f" <a href='{_href(arc.get('wayback_url'))}' target='_blank' rel='noopener'>"

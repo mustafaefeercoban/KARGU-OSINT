@@ -26,3 +26,8 @@ bin/*
 
 # tor working directory
 .tor/
+
+# fusion dashboard: local ML venv, downloaded model weights, telegram session (full account access)
+ml/.venv/
+ml/models/
+*.session*
