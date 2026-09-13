@@ -17,7 +17,7 @@ Target file format (key: value, a key may repeat):
     file: /path/photo.jpg      # for metadata
     notes: free text
 """
-import argparse, base64, hashlib, html, io, json, os, re, subprocess, sys, shutil, datetime, tempfile, threading, time, pathlib
+import argparse, base64, hashlib, html, io, json, math, os, posixpath, re, subprocess, sys, shutil, datetime, tempfile, threading, time, pathlib, urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
 HOME = pathlib.Path.home()
@@ -224,6 +224,22 @@ def run(cmd, timeout=180, use_tor=False):
         return 127, "", "tool not found"
     except Exception as e:
         return 1, "", f"error: {e}"
+
+def run_bytes(cmd, timeout=30, use_tor=False):
+    """Run a tool and return (rc, stdout_bytes, stderr_str). Never raises."""
+    if (use_tor or USE_TOR) and PROXYCHAINS:
+        pre = [PROXYCHAINS, "-f", str(PCHAINS_CONF)] if PCHAINS_CONF.exists() else [PROXYCHAINS]
+        cmd = pre + ["-q"] + cmd
+    try:
+        p = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        err = p.stderr.decode("utf-8", errors="replace") if p.stderr else ""
+        return p.returncode, p.stdout or b"", err
+    except subprocess.TimeoutExpired:
+        return 124, b"", f"TIMEOUT ({timeout}s)"
+    except FileNotFoundError:
+        return 127, b"", "tool not found"
+    except Exception as e:
+        return 1, b"", f"error: {e}"
 
 def _fail(rc, err, parsed):
     """Why a tool produced nothing, or "" when it ran cleanly.
@@ -623,6 +639,59 @@ def stage_hunter_verify(email):
             "mx_records": d.get("mx_records"), "sources": len(d.get("sources") or [])}
 
 # ---------------- STAGE 5: METADATA ----------------
+def _summarize_exif(meta):
+    """Summarize top forensic fields: Make/Model/Software/GPS/DateTimeOriginal/Creator."""
+    summary = {}
+    make = meta.get("Make") or ""
+    model = meta.get("Model") or meta.get("CameraModelName") or ""
+    lens = meta.get("LensModel") or meta.get("Lens") or meta.get("LensInfo") or ""
+    dev_parts = [str(p).strip() for p in (make, model) if str(p).strip()]
+    if dev_parts:
+        dev_str = " ".join(dev_parts)
+        if lens and str(lens).strip() not in dev_str:
+            dev_str += f" (Lens: {lens})"
+        summary["Device"] = dev_str
+    elif lens:
+        summary["Device"] = f"Lens: {lens}"
+
+    sw = (meta.get("Software") or meta.get("ProfileSoftwareDescription")
+          or meta.get("ProcessingSoftware") or meta.get("HistorySoftwareAgent") or "")
+    if sw:
+        summary["Software"] = str(sw).strip()
+
+    creator = (meta.get("Artist") or meta.get("Creator") or meta.get("By-line")
+               or meta.get("Author") or meta.get("Copyright") or meta.get("OwnerName") or "")
+    if creator:
+        summary["Creator"] = str(creator).strip()
+
+    dt = (meta.get("DateTimeOriginal") or meta.get("CreateDate")
+          or meta.get("DateCreated") or meta.get("ModifyDate") or "")
+    if dt:
+        summary["DateTime"] = str(dt).strip()
+
+    lat = meta.get("GPSLatitude")
+    lon = meta.get("GPSLongitude")
+    if lat is not None and lon is not None:
+        alt = meta.get("GPSAltitude")
+        alt_str = f" (alt: {alt}m)" if alt is not None else ""
+        summary["GPS"] = f"{lat}, {lon}{alt_str}"
+        summary["GPSLatitude"] = lat
+        summary["GPSLongitude"] = lon
+
+    return summary
+
+def _extract_exif_thumbnail(et, fpath):
+    """Attempt to extract embedded EXIF thumbnail using exiftool."""
+    if not et or not os.path.exists(fpath):
+        return None
+    for tag in ("-ThumbnailImage", "-PreviewImage", "-JpgFromRaw"):
+        rc, raw, _ = run_bytes([et, "-b", tag, fpath], timeout=15)
+        if rc == 0 and len(raw) >= 128:
+            if raw.startswith(b"\xff\xd8") or raw.startswith(b"\x89PNG"):
+                mime = "image/png" if raw.startswith(b"\x89PNG") else "image/jpeg"
+                return f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
+    return None
+
 def stage_metadata(fpath):
     if not os.path.exists(fpath):
         return {"tool": "metadata", "file": fpath, "skipped": "file not found"}
@@ -638,6 +707,10 @@ def stage_metadata(fpath):
             if meta.get("Error"):
                 return {"tool": "exiftool", "file": fpath,
                         "skipped": f"exiftool could not read it: {meta['Error']}"}
+            meta["_summary"] = _summarize_exif(meta)
+            thumb = _extract_exif_thumbnail(et, fpath)
+            if thumb:
+                meta["_thumbnail"] = thumb
             return {"tool": "exiftool", "file": fpath, "meta": meta,
                     "failed": _fail(rc, err, meta)}
         except Exception:
@@ -646,8 +719,13 @@ def stage_metadata(fpath):
         import exifread  # type: ignore
         with open(fpath, "rb") as f:
             tags = exifread.process_file(f, details=False)
-        return {"tool": "exifread", "file": fpath,
-                "meta": {str(k): str(v) for k, v in tags.items()}}
+        meta = {str(k): str(v) for k, v in tags.items()}
+        meta["_summary"] = _summarize_exif(meta)
+        if "JPEGThumbnail" in tags:
+            raw = tags["JPEGThumbnail"]
+            if isinstance(raw, (bytes, bytearray)) and len(raw) >= 128:
+                meta["_thumbnail"] = "data:image/jpeg;base64," + base64.b64encode(raw).decode("ascii")
+        return {"tool": "exifread", "file": fpath, "meta": meta}
     except Exception:
         return {"tool": "metadata", "file": fpath, "skipped": "exiftool/exifread missing"}
 
@@ -905,8 +983,10 @@ def enrich_instagram(findings, usernames, use_tor=False, fetch_avatar=True):
     for u in usernames:
         r = stage_instagram(u, use_tor=use_tor)
         if r.get("ok") and fetch_avatar and r.get("profile_pic_url"):
-            r["avatar"], r["avatar_hash"], r["avatar_src"], r["avatar_sha256"] = \
-                _thumb([r["profile_pic_url"]])
+            th = _thumb([r["profile_pic_url"]])
+            r["avatar"], r["avatar_hash"], r["avatar_src"], r["avatar_sha256"] = th
+            r["avatar_hashes"] = getattr(th, "hashes", {})
+            r["avatar_is_generated"] = getattr(th, "is_generated", False)
         res[u] = r
         if not r.get("ok"):
             continue
@@ -924,6 +1004,8 @@ def enrich_instagram(findings, usernames, use_tor=False, fetch_avatar=True):
             row["avatar"], row["avatar_hash"] = r["avatar"], r["avatar_hash"]
             row["avatar_src"] = r.get("avatar_src")
             row["avatar_sha256"] = r.get("avatar_sha256")
+            row["avatar_hashes"] = r.get("avatar_hashes", {})
+            row["avatar_is_generated"] = r.get("avatar_is_generated", False)
         extra = [x for x in (r.get("business_email"),) if x]
         row["emails"] = sorted(set((row.get("emails") or []) + extra))
     findings["instagram"] = res
@@ -1015,28 +1097,184 @@ def _display_name(title, ogtitle, username, site=""):
             return part
     return ""
 
-# og:image is often a generic share card, not the person's photo; rejected by URL marker
-# and by shape (a real avatar is square-ish, a share card is ~1.9:1).
-GENERIC_IMG = ("default", "logo", "share", "opengraph", "og_", "og-image", "placeholder",
-               "sprite", "favicon", "banner", "cover", "anonymous", "noavatar", "no-avatar",
-               "blank", "generic", "thumb_default")
+# Generic filenames/patterns for placeholder avatars and icons
+GENERIC_FILENAMES = {
+    "default.png", "default.jpg", "default.jpeg", "default.gif", "default.svg", "default.webp",
+    "placeholder.png", "placeholder.jpg", "placeholder.jpeg", "placeholder.svg",
+    "noavatar.png", "no-avatar.png", "no_avatar.png", "noavatar.jpg", "no_avatar.jpg",
+    "avatar.png", "avatar.jpg", "avatar.svg", "user.png", "user.jpg", "user.svg",
+    "blank.png", "blank.jpg", "anonymous.png", "anonymous.jpg", "favicon.ico",
+    "thumb_default.png", "thumb_default.jpg"
+}
 
-def _avatar_candidates(doc):
-    """Ordered guesses at the profile picture, best first."""
+GENERIC_FILENAME_PATTERNS = (
+    "default_avatar", "default-avatar", "defaultavatar",
+    "noavatar", "no-avatar", "no_avatar",
+    "avatar-default", "avatar_default",
+    "profile-default", "profile_default",
+    "placeholder-avatar", "placeholder_avatar",
+    "thumb_default", "sprite", "favicon", "apple-touch-icon", "apple_touch_icon",
+    "share-card", "og-image", "og_image", "opengraph"
+)
+
+def _is_generic_avatar_url(url):
+    """Check if the image filename looks like a generic placeholder rather than a user avatar.
+    Only checks the filename/basename to avoid rejecting valid avatar paths that contain
+    words like 'share', 'default', or 'logo' in their directory structure."""
+    if not url:
+        return True
+    try:
+        parsed = urllib.parse.urlparse(url)
+        fname = posixpath.basename(parsed.path or "").lower().split("?")[0]
+        if not fname:
+            return False
+        if fname in GENERIC_FILENAMES:
+            return True
+        if any(p in fname for p in GENERIC_FILENAME_PATTERNS):
+            return True
+        stem = posixpath.splitext(fname)[0]
+        return stem in ("default", "logo", "placeholder", "blank", "anonymous", "generic", "dummy")
+    except Exception:
+        return False
+
+def _avatar_candidates(doc, url="", site="", user=""):
+    """Ordered candidate URLs for the profile picture and cover/banner, best first.
+    Extracts from site-specific endpoints, JSON-LD, microdata, link rel, meta tags,
+    lazy-load attributes, srcset, inline styles, and img tags."""
     out = []
+    s_low = (site or "").lower()
+    u_low = (url or "").lower()
+
+    # 1. Site-specific high-confidence extractors for frequent platforms
+    if "github" in s_low or "github.com" in u_low:
+        for m in re.finditer(r"https?://avatars\.githubusercontent\.com/u/\d+[^\"\'\s<>]*", doc):
+            out.append(m.group(0))
+        for m in re.finditer(r"https?://avatars\.githubusercontent\.com/[^\"\'\s<>\?]+", doc):
+            out.append(m.group(0))
+        if user:
+            out.append(f"https://github.com/{user}.png")
+
+    if "telegram" in s_low or "t.me" in u_low:
+        for m in re.finditer(r'<img[^>]+class=["\'][^"\']*tgme_page_photo_image[^"\']*["\'][^>]+src=["\']([^"\']+)["\']', doc, re.I):
+            out.append(m.group(1))
+        for m in re.finditer(r"https?://(?:cdn\d*\.)?telesco\.pe/file/[^\"\'\s<>]+", doc):
+            out.append(m.group(0))
+
+    if "chess" in s_low or "chess.com" in u_low:
+        for m in re.finditer(r"https?://images\.chesscomfiles\.com/uploads/v1/user/\d+[^\"\'\s<>]*", doc):
+            out.append(m.group(0))
+
+    if "tradingview" in s_low or "tradingview.com" in u_low:
+        for m in re.finditer(r"https?://s3\.tradingview\.com/userpics/[^\"\'\s<>]+", doc):
+            out.append(m.group(0))
+        for m in re.finditer(r"https?://tradingview\.com/userpics/[^\"\'\s<>]+", doc):
+            out.append(m.group(0))
+
+    if "youtube" in s_low or "youtube.com" in u_low:
+        for m in re.finditer(r"https?://yt3\.ggpht\.com/[^\"\'\s<>]+", doc):
+            out.append(m.group(0))
+
+    if "gitlab" in s_low or "gitlab.com" in u_low:
+        for m in re.finditer(r"https?://gitlab\.com/uploads/-/system/user/avatar/[^\"\'\s<>]+", doc):
+            out.append(m.group(0))
+
+    if "steam" in s_low or "steamcommunity" in u_low:
+        for m in re.finditer(r"https?://avatars\.(?:steamstatic|akamai\.steamstatic)\.com/[^\"\'\s<>]+", doc):
+            out.append(m.group(0))
+
+    if "medium" in s_low or "medium.com" in u_low:
+        for m in re.finditer(r"https?://cdn-images-1\.medium\.com/[^\"\'\s<>]+", doc):
+            out.append(m.group(0))
+        for m in re.finditer(r"https?://miro\.medium\.com/v2/resize:fill:[^\"\'\s<>]+", doc):
+            out.append(m.group(0))
+
+    if "gravatar" in s_low or "gravatar.com" in u_low:
+        for m in re.finditer(r"https?://(?:secure\.)?gravatar\.com/avatar/[a-f0-9]{32,64}", doc, re.I):
+            out.append(m.group(0))
+
+    # 2. JSON-LD (application/ld+json)
+    for m in re.finditer(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', doc, re.I | re.S):
+        block = m.group(1).strip()
+        try:
+            data = json.loads(block)
+            def scan_json(obj):
+                if isinstance(obj, dict):
+                    img = obj.get("image") or obj.get("logo")
+                    if isinstance(img, str):
+                        out.append(img)
+                    elif isinstance(img, dict) and img.get("url"):
+                        out.append(img["url"])
+                    elif isinstance(img, list):
+                        for item in img:
+                            if isinstance(item, str): out.append(item)
+                            elif isinstance(item, dict) and item.get("url"): out.append(item["url"])
+                    for v in obj.values():
+                        scan_json(v)
+                elif isinstance(obj, list):
+                    for item in obj: scan_json(item)
+            scan_json(data)
+        except Exception:
+            for img_match in re.finditer(r'"(?:image|contentUrl)"\s*:\s*"(https?://[^"]+)"', block):
+                out.append(img_match.group(1))
+
+    # 3. Microdata (itemprop="image")
+    for pat in (r'<[^>]+itemprop=["\']image["\'][^>]+(?:src|content)=["\']([^"\']+)["\']',
+                r'<[^>]+(?:src|content)=["\']([^"\']+)["\'][^>]+itemprop=["\']image["\']'):
+        for m in re.finditer(pat, doc, re.I):
+            out.append(m.group(1))
+
+    # 4. Link rel="image_src". apple-touch-icon is deliberately excluded: it is the site's
+    # own icon, it is square so it clears the shape gate, and ranking above og:image it
+    # became "the avatar" on any page that declares one.
+    for pat in (r'<link[^>]+rel=["\']image_src["\'][^>]+href=["\']([^"\']+)["\']',
+                r'<link[^>]+href=["\']([^"\']+)["\'][^>]+rel=["\']image_src["\']'):
+        for m in re.finditer(pat, doc, re.I):
+            out.append(m.group(1))
+
+    # 5. OpenGraph and Twitter
     for prop in ("og:image", "twitter:image", "twitter:image:src"):
         v = _meta(doc, prop)
-        if v.startswith("http"):
+        if v:
             out.append(v)
+
+    # 6. Lazy-load & srcset
+    for pat in (r'<img[^>]+(?:class|id)=["\'][^"\']*(?:avatar|profile|user|author)[^"\']*["\'][^>]+(?:data-src|data-original|data-lazy-src|data-highres)=["\']([^"\']+)["\']',
+                r'<img[^>]+(?:data-src|data-original|data-lazy-src|data-highres)=["\']([^"\']+)["\'][^>]+(?:class|id)=["\'][^"\']*(?:avatar|profile|user|author)'):
+        for m in re.finditer(pat, doc, re.I):
+            out.append(m.group(1))
+    for m in re.finditer(r'<img[^>]+(?:class|id)=["\'][^"\']*(?:avatar|profile|user)[^"\']*["\'][^>]+srcset=["\']([^"\']+)["\']', doc, re.I):
+        for part in m.group(1).split(","):
+            cand_url = part.strip().split()[0]
+            if cand_url:
+                out.append(cand_url)
+
+    # 7. Inline background-image on avatar elements
+    for pat in (r'<[^>]+(?:class|id)=["\'][^"\']*(?:avatar|profile|user-photo|user-img|author-thumb)[^"\']*["\'][^>]+style=["\'][^"\']*background(?:-image)?:\s*url\(["\']?([^"\'\)]+)["\']?\)',
+                r'<[^>]+style=["\'][^"\']*background(?:-image)?:\s*url\(["\']?([^"\'\)]+)["\']?\)[^>]+(?:class|id)=["\'][^"\']*(?:avatar|profile|user-photo|user-img|author-thumb)'):
+        for m in re.finditer(pat, doc, re.I):
+            out.append(m.group(1))
+
+    # 8. Standard img with avatar class/id
     for pat in (r'<img[^>]{0,300}?(?:class|id)=["\'][^"\']{0,140}avatar[^"\']{0,140}["\'][^>]{0,300}?src=["\'](https?://[^"\']{5,400})',
                 r'<img[^>]{0,300}?src=["\'](https?://[^"\']{5,400})["\'][^>]{0,300}?(?:class|id)=["\'][^"\']{0,140}avatar'):
         for m in re.finditer(pat, doc, re.I):
             out.append(m.group(1))
+
     seen, res = set(), []
-    for u in out:
-        if u not in seen:
-            seen.add(u); res.append(u)
-    return res[:6]
+    for raw_u in out:
+        u = html.unescape(raw_u or "").strip().strip("\"'")
+        if not u:
+            continue
+        if u.startswith("//"):
+            u = "https:" + u
+        elif url and (u.startswith("/") or not u.startswith(("http://", "https://"))):
+            u = urllib.parse.urljoin(url, u)
+        if not u.startswith(("http://", "https://")):
+            continue
+        if not _is_generic_avatar_url(u) and u not in seen:
+            seen.add(u)
+            res.append(u)
+    return res[:12]
 
 def _read_capped(resp, cap):
     """Body bytes, or None once it exceeds cap. Closes the connection either way.
@@ -1058,7 +1296,7 @@ def _read_capped(resp, cap):
 def _dhash(im, s=8):
     """Perceptual difference hash — same picture on two sites gives (almost) the same value."""
     from PIL import Image as _I
-    g = im.convert("L").resize((s + 1, s), _I.LANCZOS)
+    g = im.convert("L").resize((s + 1, s), _I.Resampling.LANCZOS)
     px = g.tobytes()
     bits = 0
     for r in range(s):
@@ -1066,6 +1304,79 @@ def _dhash(im, s=8):
         for c in range(s):
             bits = (bits << 1) | (1 if px[row + c] > px[row + c + 1] else 0)
     return bits
+
+_N_PHASH = 32
+_COS_TABLE = [[math.cos((2 * x + 1) * u * math.pi / (2 * _N_PHASH)) for x in range(_N_PHASH)] for u in range(8)]
+
+def _phash(im):
+    """64-bit DCT-based perceptual hash (pHash).
+    Pure-Python implementation with zero external dependencies (no numpy, no scipy).
+    Resizes image to 32x32 grayscale, computes lowest 8x8 2D DCT-II coefficients,
+    and sets bits based on median threshold of AC coefficients."""
+    from PIL import Image as _I
+    g = im.convert("L").resize((_N_PHASH, _N_PHASH), _I.Resampling.LANCZOS)
+    px = list(g.tobytes())
+    row_dct = [[0.0] * _N_PHASH for _ in range(8)]
+    for u in range(8):
+        c_u = _COS_TABLE[u]
+        for y in range(_N_PHASH):
+            offset = y * _N_PHASH
+            row_dct[u][y] = sum(px[offset + x] * c_u[x] for x in range(_N_PHASH))
+    dct = []
+    for u in range(8):
+        for v in range(8):
+            c_v = _COS_TABLE[v]
+            dct.append(sum(row_dct[u][y] * c_v[y] for y in range(_N_PHASH)))
+    # Median over the AC coefficients only, as the reference implementation does. dct[0] (DC)
+    # then always lands above it, so bit 63 is constant and the hash carries 63 usable bits.
+    ac = dct[1:]
+    med = sorted(ac)[31]
+    bits = 0
+    for val in dct:
+        bits = (bits << 1) | (1 if val > med else 0)
+    return bits
+
+def _is_generated_avatar(im):
+    """Detect default/letter/initials avatars (e.g. colored circle with 'AG' or 1-2 letters).
+    These produce identical or near-identical hashes for completely unrelated people.
+    Signals:
+      1) Discrete dominant color count <= 3 (accounting for >= 96% of pixels)
+      2) Low grayscale variance (uniform flat background) or minimal discrete palette."""
+    try:
+        from PIL import ImageStat, Image as _I
+        small = im.convert("RGB").resize((64, 64), _I.Resampling.NEAREST)
+        q = small.quantize(colors=16)
+        colors = q.getcolors() or []
+        colors.sort(reverse=True, key=lambda x: x[0])
+        total_px = 64 * 64
+        cum = 0
+        dom_count = 0
+        for count, _ in colors:
+            cum += count
+            dom_count += 1
+            if cum / total_px >= 0.96:
+                break
+        stat = ImageStat.Stat(small.convert("L"))
+        var = stat.var[0] if stat.var else 0
+        if dom_count <= 2:
+            return True
+        if dom_count <= 3 and (var < 800 or (cum / total_px >= 0.98)):
+            return True
+        return False
+    except Exception:
+        return False
+
+class ThumbResult(tuple):
+    """Subclass of 4-tuple (data_uri, hash_hex, url, sha256) for complete backwards compatibility,
+    with attached attributes for perceptual hashes, center-crop hashes, generated avatar flags,
+    and discovered cover/banner image."""
+    def __new__(cls, data_uri="", hash_hex="", url="", sha256="", hashes=None, is_generated=False, cover=None):
+        return super().__new__(cls, (data_uri, hash_hex, url, sha256))
+
+    def __init__(self, data_uri="", hash_hex="", url="", sha256="", hashes=None, is_generated=False, cover=None):
+        self.hashes = hashes or {}
+        self.is_generated = is_generated
+        self.cover = cover or {}
 
 def _fetch_target_ok(url):
     """Refuse to fetch anything that is not a public http(s) host.
@@ -1102,7 +1413,7 @@ def _fetch_target_ok(url):
 _THUMB_CACHE, _THUMB_LOCK = {}, threading.Lock()
 
 def _thumb_one(url, px, timeout):
-    """One candidate URL -> (data_uri, hash_hex, url, sha256) or None.
+    """One candidate URL -> ThumbResult, dict for cover, or None.
     Memoised, failures included: several rows of one scan share an avatar."""
     with _THUMB_LOCK:
         if url in _THUMB_CACHE:
@@ -1120,21 +1431,47 @@ def _thumb_one(url, px, timeout):
         if r.status_code == 200:
             blob = _read_capped(r, 8_000_000)   # None when oversized: a hostile host must not fill RAM
             if blob is not None:
-                # Cap decoded pixels rather than muting the warning: a small PNG can declare
-                # a canvas costing hundreds of MB once expanded, times 8 workers.
                 Image.MAX_IMAGE_PIXELS = 40_000_000
                 with warnings.catch_warnings():
                     warnings.simplefilter("error", Image.DecompressionBombWarning)
                     im = Image.open(io.BytesIO(blob))
                     im.load()
                 w, h = im.size
-                if w >= 48 and h >= 48 and 0.75 <= w / h <= 1.34:   # else: share card / banner
-                    hsh = _dhash(im)
-                    sha = hashlib.sha256(blob).hexdigest()
-                    im = im.convert("RGB"); im.thumbnail((px, px))
-                    buf = io.BytesIO(); im.save(buf, "JPEG", quality=78)
-                    res = ("data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode(),
-                           f"{hsh:016x}", url, sha)
+                sha = hashlib.sha256(blob).hexdigest()
+                is_avatar = (w >= 48 and h >= 48 and 0.75 <= w / h <= 1.34)
+                is_cover = (w >= 200 and h >= 60 and (w / h >= 1.4 or w / h <= 0.65))
+
+                if is_avatar:
+                    hsh_d = _dhash(im)
+                    hsh_p = _phash(im)
+                    # Center crop (85% inner area)
+                    cw, ch = max(16, int(w * 0.85)), max(16, int(h * 0.85))
+                    cx, cy = (w - cw) // 2, (h - ch) // 2
+                    im_center = im.crop((cx, cy, cx + cw, cy + ch))
+                    hsh_dc = _dhash(im_center)
+                    hsh_pc = _phash(im_center)
+
+                    is_gen = _is_generated_avatar(im)
+                    hashes = {
+                        "dhash": hsh_d,
+                        "dhash_center": hsh_dc,
+                        "phash": hsh_p,
+                        "phash_center": hsh_pc,
+                    }
+                    im_thumb = im.convert("RGB")
+                    im_thumb.thumbnail((px, px))
+                    buf = io.BytesIO()
+                    im_thumb.save(buf, "JPEG", quality=78)
+                    data_uri = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+                    res = ThumbResult(data_uri, f"{hsh_d:016x}", url, sha,
+                                      hashes=hashes, is_generated=is_gen)
+                elif is_cover:
+                    im_cov = im.convert("RGB")
+                    im_cov.thumbnail((240, 120))
+                    buf = io.BytesIO()
+                    im_cov.save(buf, "JPEG", quality=75)
+                    cov_uri = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+                    res = {"kind": "cover", "url": url, "sha256": sha, "data_uri": cov_uri}
         else:
             r.close()
     except Exception:
@@ -1144,18 +1481,31 @@ def _thumb_one(url, px, timeout):
     return res
 
 def _thumb(urls, px=72, timeout=12):
-    """Fetch the first URL that really looks like a profile picture.
-    Returns (data_uri, hash_hex, source_url, sha256) — empty strings when nothing qualified.
-    The sha256 is of the original bytes: byte-identical images are the only zero-risk match."""
+    """Fetch the first URL that qualifies as a profile picture, plus cover/banner if seen.
+    Returns ThumbResult — empty strings when nothing qualified."""
     if isinstance(urls, str):
         urls = [urls]
+    avatar_res = None
+    cover_res = None
     for url in urls:
-        if any(g in url.lower() for g in GENERIC_IMG):
+        if _is_generic_avatar_url(url):
             continue
         res = _thumb_one(url, px, timeout)
-        if res:
-            return res
-    return "", "", "", ""
+        if not res:
+            continue
+        if isinstance(res, ThumbResult) and not avatar_res:
+            avatar_res = res
+            if cover_res:
+                break
+        elif isinstance(res, dict) and res.get("kind") == "cover" and not cover_res:
+            cover_res = res
+            if avatar_res:
+                break
+    if avatar_res:
+        if cover_res:
+            avatar_res.cover = cover_res
+        return avatar_res
+    return ThumbResult("", "", "", "", cover=cover_res or {})
 
 _SCRIPT_RE = re.compile(r"<(script|style|template|noscript)\b[^>]*>.*?</\1>", re.I | re.S)
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -1270,8 +1620,15 @@ def verify_account(acc, fetch_avatar=True, timeout=15):
             out["note"] = "empty response body"
 
     if fetch_avatar and out["state"] == "verified":
-        out["avatar"], out["avatar_hash"], out["avatar_src"], out["avatar_sha256"] = \
-            _thumb(_avatar_candidates(doc))
+        cands = _avatar_candidates(doc, url=out.get("final_url") or url, site=acc.get("site") or "", user=user)
+        thumb_res = _thumb(cands)
+        out["avatar"], out["avatar_hash"], out["avatar_src"], out["avatar_sha256"] = thumb_res
+        out["avatar_hashes"] = getattr(thumb_res, "hashes", {})
+        out["avatar_is_generated"] = getattr(thumb_res, "is_generated", False)
+        cover = getattr(thumb_res, "cover", {})
+        if cover.get("url"):
+            out["cover_url"] = cover["url"]
+            out["cover_thumb"] = cover.get("data_uri", "")
     if out["state"] == "dead":
         # A 404's title is the site's error page, not a person.
         out["display_name"] = ""
@@ -1279,12 +1636,33 @@ def verify_account(acc, fetch_avatar=True, timeout=15):
     out["emails"] = sorted(set(EMAIL_RE.findall(f"{title} {ogd}")))
     return out
 
+# Two labels are not always the registrable domain: under these, foo.co.uk and bar.co.uk
+# are different sites, and collapsing them made the cross-platform photo gate reject real
+# evidence and the OPSEC ledger undercount hosts.
+_CC_SLD = {
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "net.uk", "sch.uk",
+    "com.tr", "net.tr", "org.tr", "edu.tr", "gov.tr", "k12.tr",
+    "com.au", "net.au", "org.au", "edu.au", "gov.au",
+    "co.jp", "or.jp", "ne.jp", "ac.jp", "go.jp",
+    "co.nz", "net.nz", "org.nz", "com.br", "net.br", "org.br",
+    "co.za", "org.za", "com.mx", "com.ar", "com.co", "com.pe",
+    "co.in", "net.in", "org.in", "com.cn", "net.cn", "org.cn",
+    "co.kr", "or.kr", "com.sg", "com.hk", "com.tw", "com.my",
+    "com.ph", "com.vn", "co.th", "co.id", "com.pk", "com.bd",
+    "co.il", "com.sa", "com.eg", "com.ng", "com.ua", "com.pl",
+    "com.ru", "com.es", "com.pt", "com.gr", "com.cy",
+}
+
 def _host(url):
     m = re.match(r"https?://([^/]+)", url or "")
     if not m:
         return ""
     parts = re.sub(r"^www\.", "", m.group(1).lower()).split(".")
-    return ".".join(parts[-2:]) if len(parts) >= 2 else parts[0]
+    if len(parts) < 2:
+        return parts[0]
+    if len(parts) >= 3 and ".".join(parts[-2:]) in _CC_SLD:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
 
 def stage_wayback(url, timeout=30):
     """Ask the Internet Archive whether this profile URL was ever captured.
@@ -1328,16 +1706,64 @@ def settle_unresolved(accounts, workers=6):
             acc["archive"] = res
     return sum(1 for a in todo if (a.get("archive") or {}).get("existed"))
 
+def _images_match(a, b, max_dhash=6, max_phash=8):
+    """Check if two accounts share the same photo, accounting for cropping differences.
+    Returns (matched: bool, tier: str)."""
+    # 1. Byte-identical sha256 is strong evidence
+    if a.get("avatar_sha256") and a["avatar_sha256"] == b.get("avatar_sha256"):
+        return True, "strong"
+
+    # 2. dHash comparison (full & center crop)
+    dh_a = [h for h in (a.get("avatar_hashes", {}).get("dhash"),
+                        a.get("avatar_hashes", {}).get("dhash_center")) if h is not None]
+    if not dh_a and a.get("avatar_hash"):
+        try:
+            dh_a = [int(a["avatar_hash"], 16)]
+        except ValueError:
+            pass
+
+    dh_b = [h for h in (b.get("avatar_hashes", {}).get("dhash"),
+                        b.get("avatar_hashes", {}).get("dhash_center")) if h is not None]
+    if not dh_b and b.get("avatar_hash"):
+        try:
+            dh_b = [int(b["avatar_hash"], 16)]
+        except ValueError:
+            pass
+
+    if dh_a and dh_b:
+        min_dh = min(bin(h1 ^ h2).count("1") for h1 in dh_a for h2 in dh_b)
+        if min_dh <= max_dhash:
+            return True, "possible"
+
+    # 3. pHash comparison (full & center crop)
+    ph_a = [h for h in (a.get("avatar_hashes", {}).get("phash"),
+                        a.get("avatar_hashes", {}).get("phash_center")) if h is not None]
+    ph_b = [h for h in (b.get("avatar_hashes", {}).get("phash"),
+                        b.get("avatar_hashes", {}).get("phash_center")) if h is not None]
+    if ph_a and ph_b:
+        min_ph = min(bin(h1 ^ h2).count("1") for h1 in ph_a for h2 in ph_b)
+        if min_ph <= max_phash:
+            return True, "possible"
+
+    return False, ""
+
 def group_by_photo(accounts, max_dist=6):
     """Accounts sharing the same profile picture, at two evidence tiers.
 
-    Byte-identical (sha256) is strong; a perceptual match within 6 of 64 bits is possible.
-    Near-flat hashes (default avatars) are dropped; a group must span more than one platform."""
+    Byte-identical (sha256) is strong; a perceptual match (dHash <= 6 or pHash <= 8,
+    full or center-cropped) is possible.
+    Near-flat hashes and generated letter-avatars are dropped from grouping."""
     usable = []
     for a in accounts:
         if not a.get("avatar_hash"):
             continue
-        bits = bin(int(a["avatar_hash"], 16)).count("1")
+        if a.get("avatar_is_generated"):
+            a["photo_note"] = "generated/letter avatar — excluded from cross-platform grouping"
+            continue
+        try:
+            bits = bin(int(a["avatar_hash"], 16)).count("1")
+        except ValueError:
+            continue
         if bits < 8 or bits > 56:
             a["photo_note"] = "default/near-flat avatar — too generic to be evidence"
             continue
@@ -1346,9 +1772,8 @@ def group_by_photo(accounts, max_dist=6):
     # Compare against every member, not just the first, so membership does not depend on input order.
     groups = []
     for a in usable:
-        h = int(a["avatar_hash"], 16)
         for g in groups:
-            if any(bin(h ^ int(m["avatar_hash"], 16)).count("1") <= max_dist
+            if any(_images_match(a, m, max_dhash=max_dist, max_phash=8)[0]
                    for m in g["members"]):
                 g["members"].append(a)
                 break
@@ -1606,6 +2031,11 @@ def main():
                 counts[v.get("state", "unknown")] = counts.get(v.get("state", "unknown"), 0) + 1
             ok(" · ".join(f"{STATE_LABEL.get(k, k)}: {n}" for k, n in
                           sorted(counts.items(), key=lambda kv: STATE_ORDER.get(kv[0], 9))))
+            ver_accs = [v for v in findings["verified"] if v.get("state") == "verified"]
+            n_ver = len(ver_accs)
+            n_av = sum(1 for v in ver_accs if v.get("avatar"))
+            pct = round((n_av / n_ver) * 100) if n_ver else 0
+            ok(f"avatar capture rate: {n_av}/{n_ver} verified accounts ({pct}%)")
             names = sorted({v["display_name"] for v in findings["verified"]
                             if v.get("state") == "verified" and v.get("display_name")})
             if names:
@@ -1620,7 +2050,7 @@ def main():
             if unresolved:
                 log(f"archive check on {len(unresolved)} undecided account(s) "
                     f"(asks archive.org, never the target's site) ...")
-                n = settle_unresolved(findings["verified"])
+                n = settle_unresolved(findings["verified"], workers=args.verify_workers)
                 ok(f"{n} of them were archived at least once — those profiles really existed")
 
     if not args.no_instagram and prof["username"]:
@@ -1681,7 +2111,19 @@ def main():
 
     for f in prof["file"]:
         step(f"[METADATA] {f}")
-        findings["metadata"].append(stage_metadata(f))
+        res = stage_metadata(f)
+        findings["metadata"].append(res)
+        if res.get("meta"):
+            sm = res["meta"].get("_summary", {})
+            parts = []
+            if sm.get("Device"): parts.append(f"Camera: {sm['Device']}")
+            if sm.get("Software"): parts.append(f"Software: {sm['Software']}")
+            if sm.get("DateTime"): parts.append(f"Date: {sm['DateTime']}")
+            if sm.get("Creator"): parts.append(f"Creator: {sm['Creator']}")
+            if sm.get("GPS"): parts.append(f"GPS: {sm['GPS']}")
+            if res["meta"].get("_thumbnail"): parts.append("Thumbnail: extracted")
+            if parts:
+                ok(" · ".join(parts))
 
     if args.deep:
         sf = tool("sf") or tool("sf.py") or shutil.which("sf")
@@ -1801,9 +2243,14 @@ def _stats(findings):
         subs |= set(r.get("theHarvester", {}).get("hosts", []))
     confirmed = sum(1 for a in acc.values() if len(a["via"]) > 1)
     ver = findings.get("verified") or []
+    ver_accs = [v for v in ver if v.get("state") == "verified"]
+    n_ver = len(ver_accs)
+    n_av = sum(1 for v in ver_accs if v.get("avatar"))
+    av_pct = round(n_av / n_ver * 100) if n_ver else 0
     return {"accounts": len(acc), "confirmed": confirmed, "registrations": reg,
             "breaches": br, "subdomains": len(subs),
-            "verified": sum(1 for v in ver if v.get("state") == "verified"),
+            "verified": n_ver,
+            "avatars": n_av, "avatar_pct": av_pct,
             "dead": sum(1 for v in ver if v.get("state") == "dead"),
             # Everything the verifier could not settle; the cards must add up to the table.
             "undecided": sum(1 for v in ver
@@ -1950,7 +2397,9 @@ def write_html_report(findings, tpath, ts):
     cards = [(st["accounts"], "accounts found")]
     # Each card names the state it counts; verified + undecided + missing + unreachable
     # equals the number of rows in the table.
-    cards += ([(st["verified"], "verified live"), (st["undecided"], "undecided"),
+    cards += ([(st["verified"], "verified live"),
+               (f"{st.get('avatars', 0)}/{st.get('verified', 0)} ({st.get('avatar_pct', 0)}%)", "avatars captured"),
+               (st["undecided"], "undecided"),
                (st["dead"], "confirmed missing"), (st["unreachable"], "unreachable here")]
               if st["did_verify"] else [(st["confirmed"], "confirmed by 2 tools")])
     cards += [(st["registrations"], "site registrations"), (st["breaches"], "breach records"),
@@ -2038,6 +2487,20 @@ def write_html_report(findings, tpath, ts):
                 a(f"<div>Reverse image search<br><span class='mut'>({_e(where)} photo)</span></div>"
                   f"<div>{links}<br><span class='mut'>Opens the picture at a search engine — "
                   f"this leaves your query with that engine, not with the target.</span></div>")
+            by_cover = {}
+            for r in accounts:
+                csrc = r.get("cover_url")
+                if not csrc:
+                    continue
+                by_cover.setdefault(csrc, {"src": csrc, "thumb": r.get("cover_thumb"), "sites": []})["sites"].append(r.get("site") or "?")
+            for cov in by_cover.values():
+                links = " · ".join(f"<a href='{_href(u)}' target='_blank' rel='noopener'>{_e(n)}</a>"
+                                   for n, u in reverse_image_links(cov["src"]))
+                where = ", ".join(sorted(set(cov["sites"])))
+                cov_img = f"<img src='{_img(cov['thumb'])}' style='max-height:42px;vertical-align:middle;margin-right:8px;border-radius:4px;border:1px solid #444'>" if cov.get("thumb") else ""
+                a(f"<div>Reverse image search<br><span class='mut'>({_e(where)} cover)</span></div>"
+                  f"<div>{cov_img}{links}<br><span class='mut'>Opens the profile banner/cover at a search engine — "
+                  f"useful for identifying event photos or corporate branding.</span></div>")
             for u, ig in (findings.get("instagram") or {}).items():
                 if not ig.get("ok"):
                     continue
@@ -2307,16 +2770,30 @@ def write_html_report(findings, tpath, ts):
                 a(f"<div class='box mut'>{_e(m.get('file'))}: skipped ({_e(m['skipped'])})</div>")
             else:
                 meta = m.get("meta", {})
-                gps = {k: v for k, v in meta.items() if "GPS" in str(k)}
+                sm = meta.get("_summary") or _summarize_exif(meta)
                 a(f"<div class='box'><b>{_e(m.get('file'))}</b> <span class='mut'>({_e(m.get('tool'))}, {len(meta)} fields)</span>")
-                if gps:
-                    a("<div class='kv' style='margin-top:8px'>" + "".join(f"<div>{_e(k)}</div><div>{_e(v)}</div>" for k, v in gps.items()) + "</div>")
+                if sm:
+                    a("<div class='kv' style='margin-top:8px'>")
+                    for k in ("Device", "Software", "Creator", "DateTime", "GPS"):
+                        if k in sm:
+                            val_html = _e(sm[k])
+                            if k == "GPS" and "GPSLatitude" in sm and "GPSLongitude" in sm:
+                                val_html += f" · 📍 <a href='https://www.google.com/maps?q={_e(sm['GPSLatitude'])},{_e(sm['GPSLongitude'])}' target='_blank' rel='noopener'>Open map</a>"
+                            a(f"<div><b>{_e(k)}</b></div><div>{val_html}</div>")
+                    a("</div>")
+                elif "GPSLatitude" in meta and "GPSLongitude" in meta:
                     lat, lon = meta.get("GPSLatitude"), meta.get("GPSLongitude")
-                    # `is not None`: a coordinate of exactly 0 is a real position.
                     if lat is not None and lon is not None:
                         a(f"<p>📍 <a href='https://www.google.com/maps?q={_e(lat)},{_e(lon)}' target='_blank' rel='noopener'>Open location on the map</a></p>")
+
+                if meta.get("_thumbnail"):
+                    a(f"<div style='margin-top:12px;padding:8px;background:rgba(255,255,255,0.04);border-radius:6px'>"
+                      f"<b>Embedded EXIF Thumbnail</b> <span class='mut'>(often uncropped/unedited camera original):</span><br>"
+                      f"<img src='{meta['_thumbnail']}' style='max-height:160px;margin-top:6px;border-radius:4px;border:1px solid #555'>"
+                      f"</div>")
+
                 a("<details style='margin-top:8px'><summary>All metadata fields</summary><div class='kv' style='margin-top:8px'>"
-                  + "".join(f"<div>{_e(k)}</div><div>{_e(str(v)[:200])}</div>" for k, v in list(meta.items())[:200]) + "</div></details></div>")
+                  + "".join(f"<div>{_e(k)}</div><div>{_e(str(v)[:200])}</div>" for k, v in list(meta.items())[:200] if not str(k).startswith("_")) + "</div></details></div>")
     else:
         a("<div class='box mut'>No file provided.</div>")
 

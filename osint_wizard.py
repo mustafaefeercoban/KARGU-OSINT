@@ -4,7 +4,7 @@
 KARGU-OSINT · interactive target intake wizard (English).
 
 Asks for every known detail one question at a time, validates the answers,
-creates one folder per case under ~/osint/cases/ and (optionally) starts the scan.
+creates one folder per case under cases/ and (optionally) starts the scan.
 
 Usage:
     kargu-new                 # full interactive wizard
@@ -189,8 +189,8 @@ def main():
 
     print()
     print(CY("╔══════════════════════════════════════════════════════════╗"))
-    print(CY("║   KARGU-OSINT · TARGET INTAKE                                ║"))
-    print(CY("║   Answer what you know. Anything unknown can be skipped.  ║"))
+    print(CY("║   KARGU-OSINT · TARGET INTAKE                            ║"))
+    print(CY("║   Answer what you know. Anything unknown can be skipped. ║"))
     print(CY("╚══════════════════════════════════════════════════════════╝"))
     print(DIM("  Only run this against targets you are authorised to investigate"))
     print(DIM("  (your own accounts, or an engagement you have permission for)."))
@@ -251,7 +251,7 @@ def main():
     print(DIM(f"  The report ({case}.html) will land in the same folder."))
 
     if args.no_run:
-        print(DIM(f"  Run it later with:  osint {tfile}"))
+        print(DIM(f"  Run it later with:  kargu {tfile}"))
         return
 
     cmd = [sys.executable, str(OSINT / "osint_run.py"), str(tfile), "--depth", str(opts["depth"])]
