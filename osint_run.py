@@ -158,6 +158,19 @@ def write_proxychains_conf(port=9050):
     except Exception:
         return False
 
+def route_label(e):
+    return "Mullvad" if e.get("mullvad") else "Tor" if e.get("tor") else "direct"
+
+def egress_verdict(start, end):
+    """(route changed, address rotated) between the two exit readings.
+
+    Tor rotates circuits and Mullvad switches relays on their own, so a different IP under the
+    same protection is normal; only a different route means the scan lost its cover."""
+    if start.get("error") or end.get("error"):
+        return False, False
+    changed = route_label(start) != route_label(end)
+    return changed, (not changed and start.get("ip") != end.get("ip"))
+
 def egress_info(via_tor=False):
     """Current egress IP as the internet sees it; reported verbatim in the OPSEC section."""
     try:
@@ -2574,15 +2587,17 @@ def main():
     # advertised exit held for the whole scan.
     eg_end = egress_info(via_tor=args.tor)
     OPSEC_LOG["egress_end"] = eg_end
-    changed = (not eg.get("error") and not eg_end.get("error")
-               and (eg.get("ip") != eg_end.get("ip")
-                    or bool(eg.get("mullvad")) != bool(eg_end.get("mullvad"))))
+    changed, rotated = egress_verdict(eg, eg_end)
+    _lbl = route_label
     OPSEC_LOG["egress_changed"] = changed
+    OPSEC_LOG["egress_rotated"] = rotated
     if changed:
-        _lbl = lambda e: "Mullvad" if e.get("mullvad") else "Tor" if e.get("tor") else "direct"
-        print(_c("1;31", f"[EXIT] WARNING: the exit changed during the scan — started as "
-                         f"{eg.get('ip')} ({_lbl(eg)}), ended as {eg_end.get('ip')} ({_lbl(eg_end)}). "
+        print(_c("1;31", f"[EXIT] WARNING: the route changed during the scan — started on "
+                         f"{_lbl(eg)} ({eg.get('ip')}), ended on {_lbl(eg_end)} ({eg_end.get('ip')}). "
                          "Part of this scan may be attributable to your own connection."))
+    elif rotated:
+        print(_c("32", f"[EXIT] {_lbl(eg)} held for the whole scan; the address rotated "
+                       f"{eg.get('ip')} -> {eg_end.get('ip')}, which is normal."))
     elif eg_end.get("error"):
         warn(f"could not re-check the exit address at the end ({eg_end['error']})")
     OPSEC_LOG["tor"] = USE_TOR
@@ -3565,6 +3580,10 @@ def write_html_report(findings, tpath, ts):
               f"{_e(eg2.get('ip'))} <span class='mut'>({_e(eg2.get('country'))}) — the route above did "
               "not hold for the whole run. Requests made after it changed left over a different "
               "connection, possibly your own; treat this scan as exposed.</span></div>")
+        elif op.get("egress_rotated"):
+            a("<div>Exit at the end of the scan</div><div><span class='tag ok'>route held</span> "
+              f"<span class='mut'>{_e(eg2.get('ip'))} — the address rotated during the run, which Tor "
+              "and Mullvad both do on their own; the protection itself never lapsed.</span></div>")
         elif eg2 and not eg2.get("error"):
             a("<div>Exit at the end of the scan</div><div><span class='tag ok'>unchanged</span> "
               f"<span class='mut'>{_e(eg2.get('ip'))} — the same exit held from start to finish</span></div>")

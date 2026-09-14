@@ -27,6 +27,15 @@
 .fg{margin-bottom:14px}
 .fg label{display:block;font-weight:600;font-size:13px;margin-bottom:3px}
 .fg .h{font-size:11.5px;color:var(--mut);margin-bottom:6px}
+.photo .badge{display:block;font:600 10px/1.6 ui-monospace,Menlo,monospace;text-align:center;border-radius:4px;margin-top:5px;border:1px solid var(--line);color:var(--mut)}
+.photo .badge.ok{border-color:var(--ok);color:var(--ok)}
+.photo .badge.bad{border-color:var(--bad);color:var(--bad)}
+.photo .badge.warn{border-color:var(--warn);color:var(--warn)}
+.photo.bad img{outline:2px solid var(--bad);outline-offset:-2px}
+.fg .err{font-size:11.5px;color:var(--bad);margin-top:4px;display:none}
+.fg.invalid .fc{border-color:var(--bad)}
+.fg.invalid .err{display:block}
+.hint-line{font-size:11.5px;color:var(--mut);margin-top:8px;min-height:1.2em}
 .fc{width:100%;padding:9px 12px;background:var(--bg);border:1px solid var(--line);border-radius:8px;color:#fff;font-size:13.5px;font-family:inherit}
 .fc:focus{outline:none;border-color:var(--acc)}
 .fc.mono{font-family:ui-monospace,Menlo,monospace}
@@ -77,6 +86,7 @@
             <div class="hint">JPEG, PNG, WebP, GIF, BMP · up to 8 files, 15 MB each</div>
           </div>
           <div class="photos" id="photos"></div>
+          <div class="hint-line" id="photoHint">You can also paste a picture with Ctrl+V. Every photo is checked for a face before the scan starts.</div>
           <div class="fg" style="margin-top:14px">
             <label for="image">Reference photo URLs or paths</label>
             <div class="h">Comma separated. Pictures on the web are fetched over the scan's own exit route.</div>
@@ -99,7 +109,8 @@
             <div class="opt wide mut">Face matching / CLIP are off: run <code>dashboard/install-ml.sh</code></div>
             {% endif %}
           </div>
-          <button type="submit" class="start" id="startBtn">Start scan</button>
+          <button type="submit" class="start" id="startBtn" disabled>Start scan</button>
+          <div class="hint-line" id="startHint">Add at least one photo or one identity field.</div>
         </div>
       </div>
 
@@ -118,8 +129,9 @@
             {% if f.key == "notes" %}
             <textarea class="fc" id="{{ f.key }}" name="{{ f.key }}" rows="2"></textarea>
             {% else %}
-            <input class="fc{% if f.key in ('username','email','phone','domain','file') %} mono{% endif %}" type="text" id="{{ f.key }}" name="{{ f.key }}">
+            <input class="fc{% if f.key in ('username','email','phone','domain','file') %} mono{% endif %}" type="text" id="{{ f.key }}" name="{{ f.key }}" autocomplete="off">
             {% endif %}
+            <div class="err" id="err-{{ f.key }}"></div>
           </div>
           {% endfor %}
         </div>
@@ -154,28 +166,136 @@
 <script>
 "use strict";
 const $ = s => document.querySelector(s);
-let files = [];
+const CSRF = $("#intake").querySelector("[name=csrf]").value;
+const IDENTITY = [...document.querySelectorAll(".fg .fc")].filter(el => el.name && el.name !== "case");
+let files = [], checks = {};
 const input = $("#photoInput"), drop = $("#drop"), grid = $("#photos"), count = $("#photoCount");
+const key = f => `${f.name}:${f.size}:${f.lastModified}`;
+
 ["dragenter", "dragover"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add("over"); }));
 ["dragleave", "drop"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove("over"); }));
 drop.addEventListener("drop", e => addFiles(e.dataTransfer.files));
 input.addEventListener("change", () => { addFiles(input.files); input.value = ""; });
+// a picture copied out of a browser never reaches a file dialog, so take it from the clipboard
+document.addEventListener("paste", e => {
+  const imgs = [...(e.clipboardData ? e.clipboardData.items : [])].filter(i => i.type.startsWith("image/"));
+  if (!imgs.length) return;
+  e.preventDefault();
+  addFiles(imgs.map(i => i.getAsFile()).filter(Boolean));
+});
+
+function note(msg) { $("#photoHint").textContent = msg; }
+
 function addFiles(list) {
-  for (const f of list) if (f.type.startsWith("image/") && files.length < 8) files.push(f);
+  let dropped = 0;
+  for (const f of list || []) {
+    if (!f || !f.type.startsWith("image/")) continue;
+    if (files.length >= 8) { dropped++; continue; }
+    files.push(f);
+  }
   render();
+  if (dropped) note(`${dropped} photo(s) ignored: the limit is 8.`);
+  else precheck();
 }
+
 function render() {
   grid.innerHTML = "";
   files.forEach((f, i) => {
-    const d = document.createElement("div"); d.className = "photo";
-    d.innerHTML = `<button type="button" class="rm" title="remove">×</button><img alt=""><div class="nm"></div><div class="mut" style="font-size:10px">${Math.round(f.size / 1024)} KB</div>`;
+    const c = checks[key(f)];
+    const d = document.createElement("div");
+    d.className = "photo" + (c && (c.faces === 0 || c.error) ? " bad" : "");
+    d.innerHTML = '<button type="button" class="rm" title="remove">×</button><img alt="">' +
+      '<div class="nm"></div><div class="mut" style="font-size:10px"></div><span class="badge"></span>';
     d.querySelector("img").src = URL.createObjectURL(f);
-    d.querySelector(".nm").textContent = f.name;
+    const nm = d.querySelector(".nm");
+    nm.textContent = f.name; nm.title = f.name;
+    d.querySelector(".mut").textContent = `${Math.round(f.size / 1024)} KB`;
+    const b = d.querySelector(".badge");
+    if (!c) b.textContent = "checking…";
+    else if (c.error) { b.textContent = "unreadable"; b.className = "badge bad"; }
+    else if (c.faces === 0) { b.textContent = "no face"; b.className = "badge bad"; }
+    else if (c.faces > 1) { b.textContent = `${c.faces} faces`; b.className = "badge warn"; }
+    else { b.textContent = c.face_px ? `face ${c.face_px}px` : "1 face"; b.className = "badge ok"; }
     d.querySelector(".rm").addEventListener("click", () => { files.splice(i, 1); render(); });
     grid.appendChild(d);
   });
   count.textContent = `${files.length} selected`;
+  updateStart();
 }
+
+let checkSeq = 0;
+async function precheck() {
+  if (!files.length) { note("You can also paste a picture with Ctrl+V."); return; }
+  const pending = files.filter(f => !checks[key(f)]);
+  if (!pending.length) { summarise(); return; }
+  const seq = ++checkSeq;
+  const fd = new FormData();
+  fd.append("csrf", CSRF);
+  pending.forEach(f => fd.append("photos", f));
+  try {
+    const r = await (await fetch("/api/precheck", { method: "POST", body: fd })).json();
+    if (seq !== checkSeq) return;          // a newer drop already replaced this answer
+    if (r.skipped) { note("Face check is off: " + r.skipped); return; }
+    if (!r.ok) { note(r.error || "photo check failed"); return; }
+    (r.results || []).forEach((row, i) => { if (pending[i]) checks[key(pending[i])] = row; });
+    render();
+    summarise();
+  } catch (e) { note("photo check failed"); }
+}
+
+function summarise() {
+  const rows = files.map(f => checks[key(f)]).filter(Boolean);
+  if (!rows.length) return;
+  const blind = rows.filter(x => x.faces === 0 || x.error).length;
+  const small = rows.filter(x => x.face_px && x.face_px < 60).length;
+  note(blind ? `${blind} photo(s) have no detectable face: those cannot help the face stages.`
+    : small ? `${small} photo(s) have a very small face; matching gets unreliable below about 60 px.`
+      : "Every photo has a usable face.");
+}
+
+// the server's own validators decide, so the form can never disagree with the scan
+let vTimer = null;
+IDENTITY.forEach(el => {
+  el.addEventListener("blur", () => { clearTimeout(vTimer); vTimer = setTimeout(validate, 120); });
+  el.addEventListener("input", updateStart);
+});
+async function validate() {
+  const fd = new FormData();
+  fd.append("csrf", CSRF);
+  IDENTITY.forEach(el => fd.append(el.name, el.value));
+  try {
+    const r = await (await fetch("/api/validate", { method: "POST", body: fd })).json();
+    if (!r.ok) return;
+    IDENTITY.forEach(el => {
+      const bad = (r.invalid || {})[el.name];
+      const box = el.closest(".fg"), err = box.querySelector(".err");
+      box.classList.toggle("invalid", !!bad);
+      if (err) err.textContent = bad ? bad.map(b => `${b.value} — ${b.error}`).join(" · ") : "";
+    });
+    updateStart();
+  } catch (e) { /* advisory only: the scan re-validates anyway */ }
+}
+
+function updateStart() {
+  const filled = IDENTITY.some(el => el.value.trim()) || files.length > 0;
+  const invalid = !!document.querySelector(".fg.invalid");
+  $("#startBtn").disabled = !filled || invalid;
+  $("#startHint").textContent = invalid ? "Fix the values marked in red."
+    : filled ? "" : "Add at least one photo or one identity field.";
+}
+
+// naming the case after the target saves a step, but never overwrite what was typed
+const caseEl = $("#case"), nameEl = document.getElementById("name");
+let caseTouched = false;
+caseEl.addEventListener("input", () => { caseTouched = true; });
+if (nameEl) nameEl.addEventListener("input", () => {
+  if (caseTouched) return;
+  caseEl.value = nameEl.value.trim().toLowerCase()
+    .replace(/[çğıöşü]/g, c =>
+      ({ "ç": "c", "ğ": "g", "ı": "i", "ö": "o", "ş": "s", "ü": "u" }[c]))
+    .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+});
+
 $("#intake").addEventListener("submit", async e => {
   e.preventDefault();
   const fd = new FormData($("#intake"));
@@ -191,12 +311,15 @@ $("#intake").addEventListener("submit", async e => {
     poll(r.job_id);
   } catch (err) { fail(err.message); }
 });
+
+function closeModal() { $("#modal").classList.remove("on"); updateStart(); }
 function fail(msg) {
   $("#term").textContent += `\nERROR: ${msg}\n`;
   $("#mstatus").textContent = "not started";
-  $("#mlink").innerHTML = `<a href="#" id="close">close</a>`;
-  $("#close").addEventListener("click", ev => { ev.preventDefault(); $("#modal").classList.remove("on"); $("#startBtn").disabled = false; });
+  $("#mlink").innerHTML = '<a href="#" id="close">close</a>';
+  $("#close").addEventListener("click", ev => { ev.preventDefault(); closeModal(); });
 }
+
 async function poll(jid) {
   let j;
   try {
@@ -212,10 +335,11 @@ async function poll(jid) {
     $("#mlink").innerHTML = `<a href="/case/${encodeURIComponent(j.case)}">open the dashboard →</a>`;
     if (j.status === "done") setTimeout(() => { window.location.href = `/case/${encodeURIComponent(j.case)}`; }, 1200);
   } else {
-    $("#mlink").innerHTML = `<a href="#" id="close">close</a>`;
-    $("#close").addEventListener("click", ev => { ev.preventDefault(); $("#modal").classList.remove("on"); $("#startBtn").disabled = false; });
+    $("#mlink").innerHTML = '<a href="#" id="close">close</a>';
+    $("#close").addEventListener("click", ev => { ev.preventDefault(); closeModal(); });
   }
 }
+updateStart();
 </script>
 </body>
 </html>

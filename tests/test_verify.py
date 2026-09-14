@@ -421,5 +421,28 @@ class ReportLayout(unittest.TestCase):
         self.assertNotIn("CHANGED", html)
 
 
+class ExitRouteVerdict(unittest.TestCase):
+    """A rotated Tor circuit is not a lost exit; a route change is."""
+
+    def test_same_route_different_address_is_a_rotation(self):
+        for a, b in (({"ip": "1.1.1.1", "tor": True}, {"ip": "2.2.2.2", "tor": True}),
+                     ({"ip": "1.1.1.1", "mullvad": True}, {"ip": "2.2.2.2", "mullvad": True})):
+            self.assertEqual(O.egress_verdict(a, b), (False, True))
+
+    def test_losing_the_protection_is_a_change(self):
+        self.assertEqual(O.egress_verdict({"ip": "1.1.1.1", "tor": True}, {"ip": "9.9.9.9"}), (True, False))
+        self.assertEqual(O.egress_verdict({"ip": "1.1.1.1", "mullvad": True}, {"ip": "9.9.9.9"}), (True, False))
+        self.assertEqual(O.egress_verdict({"ip": "1.1.1.1", "tor": True},
+                                          {"ip": "2.2.2.2", "mullvad": True}), (True, False))
+
+    def test_an_unchanged_exit_is_neither(self):
+        self.assertEqual(O.egress_verdict({"ip": "1.1.1.1", "tor": True}, {"ip": "1.1.1.1", "tor": True}),
+                         (False, False))
+
+    def test_an_unreadable_reading_never_raises_an_alarm(self):
+        self.assertEqual(O.egress_verdict({"error": "timeout"}, {"ip": "9.9.9.9"}), (False, False))
+        self.assertEqual(O.egress_verdict({"ip": "1.1.1.1", "tor": True}, {"error": "timeout"}), (False, False))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

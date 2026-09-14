@@ -25,6 +25,59 @@ Docker imajı) bölüm 8'de listeli.
 
 ---
 
+## Nasıl görünüyor
+
+<p align="center"><img src="docs/img/intake.jpg" alt="Yeni tarama formu" width="100%"></p>
+
+**Tarama öncesi.** `kargu-dash --new` giriş formunu açar. Referans fotoğrafları sürükleyip bırak ya da
+Ctrl+V ile yapıştır, bildiklerini yaz, aşamaları seç. Her fotoğraf önce yerel yüz dedektöründen geçer:
+`face 143px` kullanılabilir demek, `no face` ise yüz aşamalarına katkı sağlayamaz demek; bunu bir
+tarama sonunda değil saniyeler içinde öğrenirsin. Bir alandan çıktığında tarayıcının kendi
+doğrulayıcıları çalışır, yani form ile taramanın kararı hiçbir zaman ayrışmaz.
+
+<p align="center"><img src="docs/img/dashboard.jpg" alt="Vaka paneli" width="100%"></p>
+
+**Tarama sonrası.** Her vaka için tek sayfa. Solda doğrulanmış hesaplar ve senin çıkış rotan, ortada
+harita ve açık kaynak akışları, sağda resimler ve yüz eşleştirme.
+
+<p align="center"><img src="docs/img/cases.jpg" alt="Vaka listesi" width="100%"></p>
+
+**Bütün vakalar.** Her satır kaç hesabın kaçının doğrulandığını ve taramanın gerçekten hangi rotadan
+çıktığını taşır; ev bağlantısına bağlanabilir bir tarama tek bakışta görünür.
+
+<table>
+<tr>
+<td width="45%" valign="top">
+
+<img src="docs/img/visual-panel.jpg" alt="Görsel panel" width="100%">
+
+</td>
+<td valign="top">
+
+**Görsel panel.** Referans fotoğrafın, eşleştiği hesaplar ve her motorun ne dediği. `face 0.97`
+InsightFace kosinüsü; `DeepFace confirms` ikinci motorun katıldığı anlamına gelir,
+`DeepFace does not confirm` ise reddettiği, ve o fotoğraf yanlışlıkla kanıt sanılmasın diye damgalanır.
+Altında taramanın yakaladığı resimler, aynı yüzü paylaşan hesaplar ve senin fotoğrafın ile bulunanlar
+arasındaki CLIP benzerliği yer alır.
+
+Motorlar bilerek katmanlı. Hash ve InsightFace eşleşme önerebilir, DeepFace yalnızca onaylar ya da
+reddeder. Yüz içermeyen avatarlarda tek başına puanlayan DeepFace üç alakasız logoyu aynı kişi ilan
+etti, bu yüzden öneri yapmasına izin verilmiyor. Ayrıntılar 17. bölümde.
+
+</td>
+</tr>
+</table>
+
+<p align="center"><img src="docs/img/report.jpg" alt="HTML rapor" width="100%"></p>
+
+**Rapor.** Vakanın yanında tek parça bir HTML dosyası, avatarlar gömülü, her iddianın nasıl elde
+edildiği ve ne kadar güçlü olduğu etiketli.
+
+> Ekran görüntülerinde kurgusal bir profil kullanıldı. Yüzler InsightFace ile gelen örnek fotoğraftan
+> alındı; bu depoda hiçbir gerçek kişinin verisi yer almıyor.
+
+---
+
 ## 0) Kurulum
 
 Repoda yalnızca uygulama kodu var; araç ortamları (`pipx/`, `tools/`, `bin/` bağlantıları) klasörün
@@ -523,12 +576,24 @@ bağlantısına atfedildiğini okur — araç onun yerine VPN açmaz. Varsayıla
 
 ## 17) Füzyon paneli, referans fotoğraflar ve yerel görüntü analizi
 
-`kargu-dash` yerel bir panel açar (yalnız loopback, yazdırılan bağlantıda sürece özel token, `KARGU_DASH_PORT`):
+`kargu-dash` yerel bir panel açar (yalnız loopback, yazdırılan bağlantıda sürece özel token, `KARGU_DASH_PORT`).
+`kargu-dash --new` doğrudan giriş formunda açılır:
 
 - **Yeni tarama** (`/new`): sihirbazla aynı alanlar + kişinin **referans fotoğrafları** için sürükle-bırak
-  alanı (en fazla 8 dosya, 15 MB; her yükleme gerçekten görsel olarak çözülmek zorunda). Fotoğraflar vaka
-  klasörüne `refs/` altında kaydedilir, hedef dosyaya `image:` satırları olarak yazılır ve tarama canlı
-  log ile arka planda başlar. Başlatma isteği CSRF token'ı ve `Origin`/`Host` denetimi taşır.
+  alanı (en fazla 8 dosya, 15 MB; her yükleme gerçekten görsel olarak çözülmek zorunda). Sürükleyip
+  bırakabilir, dosya seçebilir ya da Ctrl+V ile yapıştırabilirsin. Fotoğraflar vaka klasörüne `refs/`
+  altında kaydedilir, hedef dosyaya `image:` satırları olarak yazılır ve tarama canlı log ile arka planda
+  başlar. Başlatma isteği CSRF token'ı ve `Origin`/`Host` denetimi taşır. Tarama başlamadan önce iki
+  kontrol çalışır:
+  - **Yüz kontrolü.** Bırakılan her fotoğraf yerel dedektörden geçer ve bir rozet alır: `face 143px`,
+    `no face`, `2 faces` ya da `unreadable`. İçinde yüz bulunmayan bir referans fotoğrafı yüz aşamalarına
+    hiçbir katkı sağlayamaz, 60 px'in belirgin altındaki bir yüz de güvenilir eşleşmez; bunu bir tarama
+    sonunda değil birkaç saniyede öğrenirsin. Yerel görüntü yığını gerekir, yoksa rozet satırı kontrolün
+    kapalı olduğunu söyler ve başka hiçbir şey değişmez.
+  - **Alan doğrulama.** Bir alandan çıktığında tarayıcının kendi doğrulayıcıları sunucu tarafında çalışır
+    ve hatalı değerleri, taramanın vereceği mesajın aynısıyla yerinde işaretler. En az bir fotoğraf ya da
+    bir kimlik alanı dolana ve kırmızı işaret kalmayana kadar başlat düğmesi kapalı kalır. Vaka adı, sen
+    kendin yazana kadar ad soyaddan otomatik doldurulur.
 - **Vaka sayfası** (`/case/<klasör>`), üç panel:
   - *Kimlik*: özet kartlar, avatarlı doğrulanmış hesaplar, e-posta kayıtları, senin çıkış rotan.
   - *Bağlam*: OpenStreetMap ve NASA GIBS (MODIS gerçek renk, 250 m — arazi, asla insan) katmanlı Leaflet

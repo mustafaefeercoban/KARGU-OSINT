@@ -16,9 +16,10 @@ Runs in ml/.venv (Python 3.12); the scanner and the dashboard call it as a subpr
 Face embeddings are special-category biometric data (KVKK art. 6 / GDPR art. 9):
 callers gate them behind an explicit opt-in (--faces / --deepface).
 
-    vision.py analyze <case.json | -> [--faces] [--deepface] [--clip] [--threshold 0.5] [--base DIR]
-    vision.py clip    <case.json> --query "text"
-    vision.py warmup                      # download the models once (needs network)
+    vision.py analyze   <case.json | -> [--faces] [--deepface] [--clip] [--threshold 0.5] [--base DIR]
+    vision.py clip      <case.json> --query "text"
+    vision.py facecheck <img> [<img> ...]   # how many faces per picture, for the intake form
+    vision.py warmup                        # download the models once (needs network)
 """
 import argparse
 import base64
@@ -165,6 +166,8 @@ def deepface_confirm(images, pairs, models=None, detector=None):
     pictures instead of quadratic. enforce_detection stays on: a picture with no detectable
     face abstains, rather than having its raw pixels scored as though they were a face.
     """
+    if not pairs:
+        return []          # nothing was proposed, so there is nothing to confirm and no model to load
     models = models or DEEPFACE_MODELS
     detector = detector or DEEPFACE_DETECTOR
     import numpy as np
@@ -329,6 +332,32 @@ def analyze(case, faces=True, deepface=False, clip=False, threshold=0.5, base=No
     return res
 
 
+def facecheck(paths):
+    """Faces per picture, so the intake form can warn before a scan that a photo is unusable."""
+    import numpy as np
+    from insightface.app import FaceAnalysis
+    if not (MODELS / "models" / FACE_MODEL).is_dir():
+        return {"error": "face model missing: run `ml/vision.py warmup`"}
+    app = FaceAnalysis(name=FACE_MODEL, root=str(MODELS), providers=["CPUExecutionProvider"])
+    app.prepare(ctx_id=-1, det_size=(640, 640))
+    out = []
+    for path in paths:
+        row = {"path": path}
+        try:
+            im = _open(Path(path))
+            row["width"], row["height"] = im.size
+            faces = app.get(np.array(_upscaled(im))[:, :, ::-1])
+            row["faces"] = len(faces)
+            if faces:
+                # the largest face is the one DeepFace would re-embed
+                x1, y1, x2, y2 = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])).bbox
+                row["face_px"] = int(min(x2 - x1, y2 - y1))
+        except Exception as e:
+            row["error"] = f"{type(e).__name__}: {e}"[:120]
+        out.append(row)
+    return {"results": out}
+
+
 def clip_search(case, query, base=None):
     import torch
     import open_clip
@@ -372,8 +401,9 @@ def warmup():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["analyze", "faces", "clip", "warmup"])
+    ap.add_argument("mode", choices=["analyze", "faces", "clip", "facecheck", "warmup"])
     ap.add_argument("case", nargs="?", help="case .json, or - for stdin")
+    ap.add_argument("images", nargs="*", help="facecheck: picture paths")
     ap.add_argument("--faces", action="store_true")
     ap.add_argument("--deepface", action="store_true",
                     help="re-check the InsightFace matches with DeepFace (confirmer, needs --faces)")
@@ -391,6 +421,14 @@ def main():
         return
     # Models are cached by warmup/first use; later runs must never phone home.
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    if a.mode == "facecheck":
+        paths = ([a.case] if a.case else []) + list(a.images)
+        try:
+            out = facecheck(paths) if paths else {"results": []}
+        except Exception as e:
+            out = {"error": f"{type(e).__name__}: {e}"}
+        json.dump(out, sys.stdout, ensure_ascii=False)
+        return
     if not a.case:
         ap.error("case is required")
     try:

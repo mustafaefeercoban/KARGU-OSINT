@@ -268,6 +268,10 @@ class ConfirmerVerdicts(unittest.TestCase):
         return {"key": key, "label": key, "owner": key, "kind": "avatar",
                 "image": Image.new("RGB", (80, 80)), "faces": faces}
 
+    def test_nothing_proposed_means_nothing_to_confirm_and_no_model_is_loaded(self):
+        """InsightFace finding no pair must not look like DeepFace being unusable."""
+        self.assertEqual(V.deepface_confirm([{"key": "acct:0"}], []), [])
+
     def test_duplicate_pairs_from_a_multi_face_picture_yield_one_verdict(self):
         imgs = [self._img("target:0"), self._img("acct:0")]
         pairs = [{"a": "target:0", "b": "acct:0", "score": 0.9},

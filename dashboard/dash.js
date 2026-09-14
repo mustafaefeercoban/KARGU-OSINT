@@ -71,10 +71,14 @@ function renderIdentity() {
 
   const eg = DATA.opsec?.egress || {};
   b.appendChild(el("h3", null, "OPSEC · your exit"));
-  const changed = DATA.opsec?.egress_changed;
+  const changed = DATA.opsec?.egress_changed, rotated = DATA.opsec?.egress_rotated;
+  // a rotated Tor circuit is normal; only a change of route is a lost exit
+  const held = changed ? "<span class='tag bad'>ROUTE CHANGED</span>"
+    : rotated ? "<span class='tag ok'>held</span> <span class='mut'>address rotated</span>"
+      : "<span class='tag ok'>unchanged</span>";
   b.appendChild(el("div", "kv",
     `<div>Route</div><div><span class='tag ${eg.mullvad || eg.tor ? "ok" : "bad"}'>${eg.mullvad ? "Mullvad" : eg.tor ? "Tor" : "direct"}</span> ${esc(eg.ip || "")}</div>` +
-    `<div>Held to end</div><div>${changed ? "<span class='tag bad'>CHANGED</span>" : "<span class='tag ok'>unchanged</span>"}</div>` +
+    `<div>Held to end</div><div>${held}</div>` +
     `<div>Kill-switch</div><div>${esc(DATA.opsec?.lockdown ?? "n/a")}</div>`));
 }
 

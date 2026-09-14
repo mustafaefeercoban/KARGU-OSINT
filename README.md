@@ -26,6 +26,59 @@ Everything the scanner itself needs lives under one folder (pipx/venv, no sudo);
 
 ---
 
+## What it looks like
+
+<p align="center"><img src="docs/img/intake.jpg" alt="The new-scan form" width="100%"></p>
+
+**Before the scan.** `kargu-dash --new` opens the intake form. Drop reference photos or paste them with
+Ctrl+V, fill in whatever you know, pick the stages. Every photo is passed through the local face
+detector first: `face 143px` means it can be used, `no face` means it cannot help the face stages, so
+you learn that in seconds rather than after a scan. Leaving a field runs the scanner's own validators,
+so the form can never disagree with the scan.
+
+<p align="center"><img src="docs/img/dashboard.jpg" alt="The case dashboard" width="100%"></p>
+
+**After the scan.** One page per case. Identity on the left with the verified accounts and your own
+exit route, the map and the open feeds in the middle, pictures and face matching on the right.
+
+<p align="center"><img src="docs/img/cases.jpg" alt="The case list" width="100%"></p>
+
+**Every case.** Each row carries how many accounts were verified out of how many found, and the exit
+route the scan actually left by, so an attributable run is visible at a glance.
+
+<table>
+<tr>
+<td width="45%" valign="top">
+
+<img src="docs/img/visual-panel.jpg" alt="The visual panel" width="100%">
+
+</td>
+<td valign="top">
+
+**The visual panel.** Your reference photo, the accounts it matched, and what each engine said.
+`face 0.97` is the InsightFace cosine; `DeepFace confirms` means the second engine agreed;
+`DeepFace does not confirm` means it refused, and that picture is stamped so it cannot be read as
+evidence by mistake. Below: the pictures the scan captured, the accounts that share a face, and the
+CLIP similarity between your photo and what was found.
+
+The engines are tiered on purpose. Hash and InsightFace may propose a match; DeepFace may only agree
+or refuse. On faceless avatars DeepFace scoring alone called three unrelated logos the same person,
+so it is never allowed to propose. Section 17 has the details.
+
+</td>
+</tr>
+</table>
+
+<p align="center"><img src="docs/img/report.jpg" alt="The HTML report" width="100%"></p>
+
+**The report.** A single self-contained HTML file next to the case, avatars embedded, every claim
+labelled with how it was reached and how strong it is.
+
+> The screenshots use a synthetic profile. The faces come from the sample picture bundled with
+> InsightFace; no real person's data appears anywhere in this repository.
+
+---
+
 ## 0) Install
 
 The repository holds only the application code; the tool environments (`pipx/`, `tools/`, the `bin/` links)
@@ -531,12 +584,23 @@ is `OSINT_DEFAULT_CC=90` (Türkiye); set the environment variable if you are els
 
 ## 17) Fusion dashboard, reference photos and local vision
 
-`kargu-dash` serves a local dashboard (loopback, a per-process token in the printed link, `KARGU_DASH_PORT`):
+`kargu-dash` serves a local dashboard (loopback, a per-process token in the printed link, `KARGU_DASH_PORT`).
+`kargu-dash --new` opens straight on the intake form:
 
 - **New scan** (`/new`): the same fields as the wizard plus a drop zone for **reference photos of the
-  person** (up to 8, 15 MB each; every upload must decode as an image). They are saved under the case
-  folder as `refs/`, written into the target file as `image:` lines, and the scan starts in the
-  background with a live log. The start request carries a CSRF token and an `Origin`/`Host` check.
+  person** (up to 8, 15 MB each; every upload must decode as an image). Drop them, pick them from a file
+  dialog, or paste one with Ctrl+V. They are saved under the case folder as `refs/`, written into the
+  target file as `image:` lines, and the scan starts in the background with a live log. The start request
+  carries a CSRF token and an `Origin`/`Host` check. Two checks run before anything is scanned:
+  - **Face check.** Every dropped photo is passed through the local detector and gets a badge:
+    `face 143px`, `no face`, `2 faces` or `unreadable`. A reference picture with no detectable face
+    cannot help the face stages, and a face much below 60 px matches unreliably, so you learn that in a
+    few seconds instead of after a scan. It needs the local vision stack; without it the badge line says
+    the check is off and nothing else changes.
+  - **Field validation.** Leaving a field runs the scanner's own validators server-side and marks the bad
+    values in place with the same message the scan would give. The start button stays disabled until at
+    least one photo or one identity field is filled in and nothing is marked red. The case name fills
+    itself in from the full name until you type your own.
 - **Case page** (`/case/<folder>`), three panels:
   - *Identity*: summary cards, verified accounts with their avatars, e-mail registrations, your exit route.
   - *Context*: Leaflet map with OpenStreetMap and NASA GIBS (MODIS true colour, 250 m — terrain, never

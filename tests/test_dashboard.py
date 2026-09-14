@@ -185,6 +185,84 @@ class Intake(Base):
         self.assertEqual(list(S.CASES.iterdir()), [])
 
 
+class IntakeHelpers(Base):
+    """The two endpoints the new-scan form calls before anything is scanned."""
+
+    def _post(self, path, data, headers=None):
+        h = {"Origin": "http://localhost", **(headers or {})}
+        return self.c.post(path, data=data, headers=h, content_type="multipart/form-data")
+
+    def test_validate_reports_only_the_bad_values_using_the_real_validators(self):
+        r = self._post("/api/validate", {"csrf": S.CSRF_TOKEN, "name": "Ayşe Nur Güneş",
+                                         "email": "ok@example.com, not-an-email",
+                                         "phone": "0532 111 22 33, 12"})
+        self.assertEqual(r.status_code, 200)
+        inv = r.get_json()["invalid"]
+        self.assertNotIn("name", inv)
+        self.assertEqual([b["value"] for b in inv["email"]], ["not-an-email"])
+        self.assertEqual([b["value"] for b in inv["phone"]], ["12"])
+        self.assertIn("phone number", inv["phone"][0]["error"])
+
+    def test_validate_and_precheck_reject_a_missing_or_cross_site_token(self):
+        self.assertEqual(self._post("/api/validate", {"email": "x"}).status_code, 403)
+        self.assertEqual(self._post("/api/precheck", {"photos": (io.BytesIO(_png_bytes()), "a.png")}).status_code, 403)
+        r = self._post("/api/validate", {"csrf": S.CSRF_TOKEN, "email": "x"},
+                       {"Origin": "https://evil.example"})
+        self.assertEqual(r.status_code, 403)
+
+    def test_precheck_refuses_a_non_image_before_it_reaches_the_model(self):
+        calls = []
+        old = S.subprocess.run
+        S.subprocess.run = lambda *a, **k: calls.append(a) or old(*a, **k)
+        try:
+            r = self._post("/api/precheck", {"csrf": S.CSRF_TOKEN,
+                                             "photos": (io.BytesIO(b"<html>"), "x.png")})
+        finally:
+            S.subprocess.run = old
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("not a JPEG", r.get_json()["error"])
+        self.assertEqual(calls, [])
+
+    def test_precheck_returns_face_counts_and_cleans_up_its_temp_files(self):
+        import glob
+        class R:
+            returncode, stderr = 0, ""
+            stdout = json.dumps({"results": [{"path": "/t/p00.png", "faces": 0, "width": 20, "height": 20},
+                                             {"path": "/t/p01.png", "faces": 1, "face_px": 80}]})
+        seen = {}
+        old_run, old_ml = S.subprocess.run, S.ML_PY
+        S.subprocess.run = lambda cmd, **k: (seen.update(cmd=cmd), R())[1]
+        S.ML_PY = ROOT / "osint_run.py"
+        try:
+            r = self._post("/api/precheck", {"csrf": S.CSRF_TOKEN,
+                                             "photos": [(io.BytesIO(_png_bytes()), "logo.png"),
+                                                        (io.BytesIO(_png_bytes()), "face.png")]})
+        finally:
+            S.subprocess.run, S.ML_PY = old_run, old_ml
+        rows = r.get_json()["results"]
+        self.assertEqual([x["name"] for x in rows], ["logo.png", "face.png"])
+        self.assertEqual([x["faces"] for x in rows], [0, 1])
+        self.assertNotIn("path", rows[0])                      # temp paths never leave the server
+        self.assertIn("facecheck", seen["cmd"])
+        self.assertEqual(glob.glob("/tmp/kargu_pre_*"), [])
+
+    def test_precheck_says_so_when_the_vision_stack_is_absent(self):
+        old = S.ML_PY
+        S.ML_PY = pathlib.Path("/nonexistent")
+        try:
+            r = self._post("/api/precheck", {"csrf": S.CSRF_TOKEN,
+                                             "photos": (io.BytesIO(_png_bytes()), "a.png")})
+        finally:
+            S.ML_PY = old
+        self.assertTrue(r.get_json()["ok"])
+        self.assertIn("not installed", r.get_json()["skipped"])
+
+    def test_the_form_offers_the_photo_check_and_the_error_slots(self):
+        page = self.c.get("/new").get_data(as_text=True)
+        for probe in ("/api/precheck", "/api/validate", "Ctrl+V", 'id="startHint"', 'id="err-name"'):
+            self.assertIn(probe, page)
+
+
 class Feeds(Base):
 
     def test_telegram_unconfigured_still_returns_listener_hits(self):

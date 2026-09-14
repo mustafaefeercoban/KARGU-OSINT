@@ -8,7 +8,7 @@ Runs on the system interpreter; the vision stack (ml/.venv) and Telethon are onl
 subprocesses, so the dashboard starts without them. Loopback only, per-process access token
 in the printed link; scan launches additionally need the CSRF token.
 """
-import argparse, datetime, io, json, os, pathlib, re, secrets, socket, subprocess, sys, threading, time, uuid
+import argparse, datetime, io, json, os, pathlib, re, secrets, shutil, socket, subprocess, sys, tempfile, threading, time, uuid
 from urllib.parse import urlparse
 
 from flask import Flask, Response, abort, jsonify, redirect, render_template, request, send_file
@@ -150,7 +150,7 @@ def _route(doc):
     op = doc.get("opsec") or {}
     eg = op.get("egress") or {}
     if op.get("egress_changed"):
-        return "exit changed", "bad"
+        return "route changed", "bad"
     if eg.get("tor"):
         return "Tor", "ok"
     if eg.get("mullvad"):
@@ -330,6 +330,68 @@ def _worker(jid, cmd, folder):
         job["log"].append(f"ERROR: {e}")
         job["status"] = "error"
     job["export"] = _export(folder) is not None
+
+
+@app.post("/api/validate")
+def api_validate():
+    """Run the real intake validators so the form shows the same verdict the scan would."""
+    if not _same_origin_ok(request):
+        return jsonify(ok=False, error="rejected"), 403
+    out = {}
+    for fl in FIELDS:
+        raw = (request.form.get(fl["key"]) or "").strip()
+        if not raw:
+            continue
+        parts = [p.strip() for p in raw.split(",")] if fl["multi"] else [raw]
+        bad = []
+        for part in [x for x in parts if x]:
+            okv, val = fl["validator"](part)
+            if not okv:
+                bad.append({"value": part, "error": val})
+        if bad:
+            out[fl["key"]] = bad
+    return jsonify(ok=True, invalid=out)
+
+
+@app.post("/api/precheck")
+def api_precheck():
+    """Faces per dropped photo, before anything is scanned.
+
+    A reference picture with no detectable face cannot help the face stages, and saying so
+    here saves the operator a scan."""
+    if not _same_origin_ok(request):
+        return jsonify(ok=False, error="rejected"), 403
+    files = [f for f in request.files.getlist("photos") if f and f.filename]
+    if not files:
+        return jsonify(ok=True, results=[])
+    names = [f.filename for f in files]
+    blobs, err = _validate_photos(files)
+    if err:
+        return jsonify(ok=False, error=err), 400
+    if not ML_PY.exists():
+        return jsonify(ok=True, skipped="local vision stack not installed", results=[])
+    tmp = tempfile.mkdtemp(prefix="kargu_pre_")
+    try:
+        paths = []
+        for i, (ext, blob) in enumerate(blobs):
+            fp = pathlib.Path(tmp) / f"p{i:02d}{ext}"
+            fp.write_bytes(blob)
+            paths.append(str(fp))
+        try:
+            r = subprocess.run([str(ML_PY), str(VISION), "facecheck"] + paths,
+                               stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=300)
+            res = json.loads(r.stdout) if r.stdout.strip() else {"error": (r.stderr or "no output").strip()[-200:]}
+        except (subprocess.SubprocessError, ValueError) as e:
+            res = {"error": f"face check failed ({type(e).__name__})"}
+        if res.get("error"):
+            return jsonify(ok=True, skipped=res["error"], results=[])
+        rows = res.get("results") or []
+        for row, name in zip(rows, names):
+            row["name"] = name
+            row.pop("path", None)
+        return jsonify(ok=True, results=rows)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 @app.get("/api/job/<jid>")
@@ -514,9 +576,10 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="KARGU-OSINT fusion dashboard")
     ap.add_argument("--port", type=int, default=int(os.environ.get("KARGU_DASH_PORT", "8788")))
     ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--new", action="store_true", help="open straight on the new-scan form")
     a = ap.parse_args()
     port = free_port(a.port)
-    url = f"http://127.0.0.1:{port}/?t={ACCESS_TOKEN}"
+    url = f"http://127.0.0.1:{port}/{'new' if a.new else ''}?t={ACCESS_TOKEN}"
     print(f"\n  KARGU-OSINT Dashboard  ->  {url}")
     print(f"  Cases: {CASES}")
     print("  Loopback only; the link carries this process's access token. Ctrl+C to stop.\n", flush=True)
