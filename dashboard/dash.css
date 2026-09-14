@@ -72,4 +72,10 @@ header a+a{margin-left:14px}
 .ref .m img{width:22px;height:22px;border-radius:50%;object-fit:cover}
 .pair{display:grid;grid-template-columns:auto 1fr;gap:6px 10px;align-items:center;font-size:12px;padding:5px 0;border-bottom:1px solid var(--line)}
 .pair .who img{width:26px;height:26px;border-radius:50%;object-fit:cover;vertical-align:middle;margin-right:4px}
+.pic.disputed img,.acct.disputed img{border-color:var(--bad)}
+.pic.disputed{position:relative}
+.pic.disputed::after{content:"NOT CONFIRMED";position:absolute;left:0;right:0;bottom:18px;background:rgba(172,28,28,.92);color:#fff;font:700 7px/1.5 ui-monospace,Menlo,monospace;text-align:center;letter-spacing:.04em}
+.df{display:inline-block;font:600 10px/1 ui-monospace,Menlo,monospace;padding:4px 7px;border-radius:99px;margin:0 4px 4px 0;border:1px solid var(--bad);color:var(--bad)}
+.df.ok{border-color:var(--ok);color:var(--ok)}
+.df.na{border-color:var(--line);color:var(--mut)}
 .mapbar button{margin-left:auto}

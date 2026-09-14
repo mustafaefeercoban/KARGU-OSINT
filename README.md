@@ -233,6 +233,7 @@ If you're going to investigate a company domain, it's very useful.
 | `--no-instagram` | skip the instaloader profile step |
 | `-i, --image PATH\|URL` | a reference photo of the person (repeatable; same as `image:` in the target file). Hashed against every captured profile picture; reverse-search links are generated |
 | `--faces` | compare faces across the reference photos and the captured pictures with the local InsightFace model (**biometric processing — opt-in, needs `dashboard/install-ml.sh`**, section 17) |
+| `--deepface` | re-check every `--faces` match with DeepFace (Facenet512 + VGG-Face). A match DeepFace refuses is marked **disputed** and its picture is stamped `DEEPFACE NOT CONFIRMED` |
 | `--clip` | CLIP visual similarity between the reference photos and the captured pictures (local, same venv) |
 | `--face-threshold X` | cosine similarity a face pair must reach to count (default 0.5; ≥ 0.65 is shown as strong) |
 | `--no-lockdown` | do not enable Mullvad lockdown mode for the duration of the scan |
@@ -557,16 +558,49 @@ and compared with every verified account's picture. The report and the dashboard
 | `face 0.xx` | InsightFace embedding cosine ≥ threshold (`--faces`); ≥ 0.65 is shown green |
 | `CLIP 0.xx` | CLIP image-image cosine ≥ 0.85 (`--clip`) — "looks alike", weaker than the others |
 
-### Local vision stack (`--faces`, `--clip`)
+### The four stages, in order
+
+The visual pipeline is tiered, and each stage only sees what the one before it let through:
+
+| # | Stage | What it does | Can it create a match? |
+|---|---|---|---|
+| 1 | hash | SHA-256, dHash, pHash, centre crops | yes |
+| 2 | InsightFace | ArcFace `buffalo_l` embeddings, cosine ≥ threshold | yes |
+| 3 | DeepFace | Facenet512 + VGG-Face re-check the pairs stage 2 matched | **no, only agrees or refuses** |
+| 4 | CLIP | ViT-B/32 semantic similarity, independent of the face stages | yes, as "looks alike" |
+
+Stage 3 is a confirmer by design. Given faceless pictures (logos, letter avatars) DeepFace scoring on
+its own produced `verified` matches between three unrelated logos, while InsightFace correctly abstained,
+so DeepFace is never allowed to propose. Its verdict per pair is one of:
+
+| Verdict | Meaning | Effect |
+|---|---|---|
+| `confirmed` | every DeepFace model agrees with InsightFace | green tag |
+| `disputed` | at least one model refuses the match | red tag, and the picture is stamped |
+| `abstained` | DeepFace's detector found no face to judge | neutral tag |
+
+A picture is stamped only when DeepFace vouched for it in **no** pair, so a photo confirmed against your
+reference keeps its face even if some other pairing was refused. The stamp is burned into the thumbnail
+(red border plus a `DEEPFACE NOT CONFIRMED` band) so it survives into the report, the JSON export and
+anywhere the picture is copied.
+
+### Local vision stack (`--faces`, `--deepface`, `--clip`)
 
 `dashboard/install-ml.sh` creates `ml/.venv` (Python 3.12 via `uv`, CPU torch, InsightFace `buffalo_l`,
-OpenCLIP ViT-B/32) and downloads the models into `ml/models/` once; afterwards `HF_HUB_OFFLINE=1` keeps the
-stage from phoning home. Neither the venv nor the models are committed. Everything runs on your CPU;
-no picture leaves the machine. The scanner keeps a 320 px copy of every captured avatar under
+OpenCLIP ViT-B/32, and optionally DeepFace) and downloads the models once; afterwards `HF_HUB_OFFLINE=1`
+keeps the stage from phoning home. Neither the venv nor the models are committed. Everything runs on your
+CPU; no picture leaves the machine. The scanner keeps a 320 px copy of every captured avatar under
 `images/` because a 72 px thumbnail rarely yields a usable face embedding.
+
+DeepFace is optional and heavy: it adds TensorFlow (~2 GB in the venv) and keeps ~757 MB of weights in
+`~/.deepface/weights`, **outside** the project folder, so remember it when following section 8. Install
+without it using `KARGU_SKIP_DEEPFACE=1 dashboard/install-ml.sh`; `--faces` and `--clip` are unaffected.
+TensorFlow and torch abort the process when both load beside ONNX Runtime, so the scanner runs CLIP in
+its own subprocess whenever DeepFace is enabled.
 
 With `--faces` the scan also groups accounts whose pictures show the **same face** (different hosts
 only), reported as `face #n` in the account table and as *Same face* rows in section 2 of the report.
+When `--deepface` refuses a link inside such a cluster the row says so (`DeepFace refused N link(s)`).
 The dashboard can re-run both analyses on a finished case (`Run face matching`); the result is saved
 as `<case>.vision.json` next to the export and shown on the next load. A CLIP **text search**
 ("uniform", "tattoo", "glasses") ranks the captured pictures by description.

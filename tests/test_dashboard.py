@@ -221,6 +221,43 @@ class Feeds(Base):
         self.assertIn("Telegram search failed", r["error"])
         self.assertEqual(calls[0][-2:], ["--", "--login"])   # the query can never become an option
 
+    def test_clip_gets_its_own_subprocess_when_deepface_runs(self):
+        """TensorFlow and torch abort the process together, so the two never share one run."""
+        self._case("v_20260101-000000", "v")
+        calls = []
+
+        def fake(name, args, timeout=1800):
+            calls.append(args)
+            return ({"ran": {"faces": True, "deepface": True}, "engine": {"faces": "if"}}
+                    if "--deepface" in args else
+                    {"ran": {"clip": True}, "engine": {"clip": "cl"}, "clip_similar": [{"a": "x"}]}), S._find_case(name)
+
+        old = S._vision
+        S._vision = fake
+        try:
+            r = self.c.post("/api/vision/v?faces=1&deepface=1&clip=1").get_json()
+        finally:
+            S._vision = old
+        self.assertEqual(len(calls), 2)
+        self.assertIn("--deepface", calls[0])
+        self.assertNotIn("--clip", calls[0])
+        self.assertEqual([a for a in calls[1] if a.startswith("--")], ["--threshold", "--clip"])
+        self.assertTrue(r["ran"]["clip"])
+        self.assertEqual(r["engine"]["clip"], "cl")
+        self.assertEqual(len(r["clip_similar"]), 1)
+
+    def test_deepface_alone_still_pulls_in_the_stage_it_confirms(self):
+        self._case("v_20260101-000000", "v")
+        calls = []
+        old = S._vision
+        S._vision = lambda name, args, timeout=1800: (calls.append(args), ({}, S._find_case(name)))[1]
+        try:
+            self.c.post("/api/vision/v?deepface=1")
+        finally:
+            S._vision = old
+        self.assertEqual(len(calls), 1)
+        self.assertIn("--faces", calls[0])
+
     def test_vision_without_venv_explains_the_install(self):
         self._case("v_20260101-000000", "v")
         old = S.ML_PY

@@ -196,6 +196,7 @@ def summary(profile, case, opts):
     print(f"  {'API sources':<24} {'enabled' if opts['api'] else 'disabled'}")
     print(f"  {'Correlation depth':<24} {opts['depth']}")
     print(f"  {'Local face matching':<24} {'yes' if opts.get('faces') else 'no'}")
+    print(f"  {'DeepFace confirmer':<24} {'yes' if opts.get('deepface') else 'no'}")
     print(f"  {'CLIP similarity':<24} {'yes' if opts.get('clip') else 'no'}")
     print(CY("──────────────────────────────────────────────────────────"))
     return empty
@@ -252,11 +253,14 @@ def main():
     opts["tor"]   = ask_yes("Route the tools through Tor (proxychains)?", False)
     opts["deep"]  = ask_yes("Run the SpiderFoot deep scan (slow)?", False)
     opts["depth"] = 1
-    opts["faces"] = opts["clip"] = False
+    opts["faces"] = opts["deepface"] = opts["clip"] = False
     if ML_PY.exists():
         print(DIM("      Local vision stack found (ml/.venv). Face matching is biometric processing:"))
         print(DIM("      use it only with a lawful basis for this target."))
         opts["faces"] = ask_yes("Compare faces across the pictures found (local, --faces)?", False)
+        if opts["faces"]:
+            print(DIM("      DeepFace re-checks each match and stamps the ones it cannot confirm."))
+            opts["deepface"] = ask_yes("Re-check the matches with DeepFace (slower, --deepface)?", False)
         opts["clip"]  = ask_yes("CLIP visual similarity for reference photos (local, --clip)?", False)
     elif profile.get("image"):
         print(DIM("      Face matching needs the local vision stack: dashboard/install-ml.sh"))
@@ -287,8 +291,9 @@ def main():
     if opts["tor"]:  cmd.append("--tor")
     if opts["deep"]: cmd.append("--deep")
     if not opts["api"]: cmd.append("--no-api")
-    if opts.get("faces"): cmd.append("--faces")
-    if opts.get("clip"):  cmd.append("--clip")
+    if opts.get("faces"):    cmd.append("--faces")
+    if opts.get("deepface"): cmd.append("--deepface")
+    if opts.get("clip"):     cmd.append("--clip")
 
     env = dict(os.environ)
     env["PATH"] = f"{OSINT/'bin'}:{env.get('PATH','')}"

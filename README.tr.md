@@ -229,6 +229,7 @@ Hedef gmail kullanan bir birey ise Hunter neredeyse hiçbir şey katmaz — bu y
 | `--no-instagram` | instaloader profil adımını atla |
 | `-i, --image YOL\|URL` | kişinin referans fotoğrafı (tekrarlanabilir; hedef dosyadaki `image:` ile aynı). Yakalanan her profil resmiyle hash üzerinden karşılaştırılır, ters görsel arama bağlantıları üretilir |
 | `--faces` | referans fotoğraflar ile yakalanan resimler arasında yerel InsightFace modeliyle yüz karşılaştırması (**biyometrik işleme — isteğe bağlı, `dashboard/install-ml.sh` gerekir**, bölüm 17) |
+| `--deepface` | `--faces` ile bulunan her eşleşmeyi DeepFace ile (Facenet512 + VGG-Face) yeniden denetler. DeepFace'in kabul etmediği eşleşme **disputed** işaretlenir ve fotoğrafına `DEEPFACE NOT CONFIRMED` damgası basılır |
 | `--clip` | referans fotoğraflar ile yakalanan resimler arasında CLIP görsel benzerliği (yerel, aynı venv) |
 | `--face-threshold X` | bir yüz çiftinin eşleşme sayılması için gereken kosinüs benzerliği (varsayılan 0.5; ≥ 0.65 güçlü gösterilir) |
 | `--no-lockdown` | tarama süresince Mullvad lockdown modunu açma |
@@ -549,7 +550,33 @@ kırpımlar) ve doğrulanmış her hesabın resmiyle karşılaştırılır. Rapo
 | `face 0.xx` | InsightFace gömme kosinüsü ≥ eşik (`--faces`); ≥ 0.65 yeşil gösterilir |
 | `CLIP 0.xx` | CLIP resim-resim kosinüsü ≥ 0.85 (`--clip`) — "benziyor", diğerlerinden zayıf |
 
-### Yerel görüntü yığını (`--faces`, `--clip`)
+### Dört aşama, sırayla
+
+Görsel boru hattı katmanlı: her aşama yalnızca bir öncekinin geçirdiğine bakar.
+
+| # | Aşama | Ne yapar | Eşleşme üretebilir mi? |
+|---|---|---|---|
+| 1 | hash | SHA-256, dHash, pHash, merkez kırpım | evet |
+| 2 | InsightFace | ArcFace `buffalo_l` gömmeleri, kosinüs ≥ eşik | evet |
+| 3 | DeepFace | Facenet512 + VGG-Face, 2. aşamanın eşleştirdiği çiftleri denetler | **hayır, yalnız onaylar ya da reddeder** |
+| 4 | CLIP | ViT-B/32 anlamsal benzerlik, yüz aşamalarından bağımsız | evet, "benziyor" olarak |
+
+3. aşama tasarım gereği doğrulayıcı. Yüz içermeyen görsellerde (logolar, harf avatarları) kendi başına
+puanladığında DeepFace üç alakasız logoyu `verified` ilan etti, InsightFace ise doğru şekilde çekimser
+kaldı; bu yüzden DeepFace'in eşleşme önermesine izin verilmiyor. Çift başına verdiği karar şunlardan biri:
+
+| Karar | Anlamı | Sonuç |
+|---|---|---|
+| `confirmed` | her DeepFace modeli InsightFace ile hemfikir | yeşil etiket |
+| `disputed` | en az bir model eşleşmeyi reddediyor | kırmızı etiket, fotoğrafa damga |
+| `abstained` | DeepFace'in dedektörü karar verecek yüz bulamadı | nötr etiket |
+
+Damga yalnızca DeepFace'in **hiçbir** çiftte doğrulayamadığı fotoğrafa basılır; senin referansınla
+doğrulanmış bir fotoğraf, başka bir eşleştirmesi reddedilse bile temiz kalır. Damga küçük resmin
+içine işlenir (kırmızı çerçeve artı `DEEPFACE NOT CONFIRMED` bandı), böylece rapora, JSON çıktısına ve
+fotoğrafın kopyalandığı her yere taşınır.
+
+### Yerel görüntü yığını (`--faces`, `--deepface`, `--clip`)
 
 `dashboard/install-ml.sh`, `ml/.venv` oluşturur (`uv` ile Python 3.12, CPU torch, InsightFace `buffalo_l`,
 OpenCLIP ViT-B/32) ve modelleri bir kez `ml/models/` altına indirir; sonrasında `HF_HUB_OFFLINE=1`
@@ -557,8 +584,15 @@ aşamanın dışarıya bağlanmasını engeller. Venv de modeller de depoya girm
 çalışır; hiçbir resim makineden çıkmaz. 72 px küçük resimden nadiren kullanılabilir yüz gömmesi
 çıktığı için tarayıcı yakaladığı her avatarın 320 px kopyasını `images/` altında tutar.
 
+DeepFace isteğe bağlı ve ağır: venv'e TensorFlow (~2 GB) ekler ve ~757 MB ağırlığı proje klasörünün
+**dışında**, `~/.deepface/weights` altında tutar; 8. bölümdeki kaldırma adımlarında bunu unutma.
+Kurmadan geçmek için `KARGU_SKIP_DEEPFACE=1 dashboard/install-ml.sh`; `--faces` ve `--clip` etkilenmez.
+TensorFlow ile torch, ONNX Runtime'ın yanında aynı süreçte yüklendiğinde süreci çökertiyor, bu yüzden
+DeepFace açıkken tarayıcı CLIP'i ayrı bir alt süreçte çalıştırır.
+
 `--faces` ile tarama, **aynı yüzü** gösteren hesapları da kümeler (yalnız farklı sitelerde); hesap
-tablosunda `face #n`, raporun 2. bölümünde *Same face* satırları olarak görünür. Panel bitmiş bir vakada
+tablosunda `face #n`, raporun 2. bölümünde *Same face* satırları olarak görünür.
+`--deepface` bu kümedeki bir bağlantıyı reddederse satır bunu söyler (`DeepFace refused N link(s)`). Panel bitmiş bir vakada
 iki analizi yeniden çalıştırabilir (`Run face matching`); sonuç dışa aktarımın yanına
 `<vaka>.vision.json` olarak kaydedilir ve sonraki açılışta gösterilir. CLIP **metin araması**
 ("uniform", "tattoo", "glasses") yakalanan resimleri tarife göre sıralar.

@@ -30,7 +30,9 @@ RESOURCES = OSINT / "resources"  # vendored OSINT Framework dataset (MIT, see SO
 CONFIG = OSINT / "config"
 ML_PY = OSINT / "ml" / ".venv" / "bin" / "python"   # optional local vision stack (dashboard/install-ml.sh)
 VISION_PY = OSINT / "ml" / "vision.py"
+DEEPFACE_WEIGHTS = pathlib.Path(os.environ.get("DEEPFACE_HOME") or pathlib.Path.home()) / ".deepface" / "weights"
 FACE_STRONG = 0.65                                   # InsightFace cosine read as a confident same-person call
+DISPUTED_MARK = "DEEPFACE NOT CONFIRMED"
 IMAGES_DIR = None                                    # <case folder>/images, set by main(); None in tests
 for d in (CASES, CONFIG):
     d.mkdir(parents=True, exist_ok=True)
@@ -1400,6 +1402,36 @@ def _jpeg_copy(im, px, quality):
     c.save(buf, "JPEG", quality=quality)
     return buf.getvalue()
 
+def _watermark(data_uri, text=DISPUTED_MARK, px=220):
+    """Stamp a caption band on a thumbnail so a disputed picture cannot be read as evidence.
+
+    Returns the original URI unchanged if anything fails: losing the picture would be worse
+    than losing the mark."""
+    if not (data_uri or "").startswith("data:image"):
+        return data_uri
+    try:
+        from PIL import Image as _I, ImageDraw, ImageFont
+        im = _I.open(io.BytesIO(base64.b64decode(data_uri.split(",", 1)[1]))).convert("RGB")
+        if im.width < px:
+            im = im.resize((px, max(1, round(im.height * px / im.width))), _I.Resampling.LANCZOS)
+        d = ImageDraw.Draw(im)
+        size = max(9, im.width // 13)
+        font = ImageFont.load_default(size=size)
+        while size > 8 and d.textlength(text, font=font) > im.width - 8:
+            size -= 1
+            font = ImageFont.load_default(size=size)
+        band = size + 9
+        d.rectangle([0, im.height - band, im.width, im.height], fill=(172, 28, 28))
+        d.rectangle([0, 0, im.width - 1, im.height - 1], outline=(172, 28, 28),
+                    width=max(2, im.width // 45))
+        d.text(((im.width - d.textlength(text, font=font)) / 2, im.height - band + 4),
+               text, font=font, fill=(255, 255, 255))
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=82)
+        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        return data_uri
+
 def _save_image(sha, blob):
     """Keep a picture under <case>/images/ for the vision stage; "" when no case folder is set."""
     if not (IMAGES_DIR and blob and sha):
@@ -1676,29 +1708,12 @@ def match_target_images_against_accounts(target_images, accounts, max_dist=6, ma
 
 MATCH_TIER_ORDER = {"strong": 0, "face": 1, "possible": 2, "similar": 3}
 
-def stage_vision(findings, accounts, faces=False, clip=False, threshold=0.5, base=None):
-    """Local face / CLIP analysis over the captured pictures (ml/vision.py in its own venv).
-
-    `accounts` is the exact list vision.py indexes as acct:<i>, so merge_vision must get
-    the same list. Nothing leaves the machine; the models are read from ml/models."""
-    if not (faces or clip):
-        return {"status": "skipped", "reason": "not requested (--faces / --clip)"}
-    if not ML_PY.exists():
-        return {"status": "skipped", "reason": "local vision stack missing (dashboard/install-ml.sh)"}
-    if faces and not (OSINT / "ml" / "models" / "models" / "buffalo_l").is_dir():
-        return {"status": "skipped", "reason": "face model not downloaded yet (ml/.venv/bin/python ml/vision.py warmup)"}
-    doc = {"target_images": findings.get("target_images") or [], "accounts": accounts,
-           "metadata": findings.get("metadata") or []}
-    cmd = [str(ML_PY), str(VISION_PY), "analyze", "-", "--threshold", str(threshold)]
-    if base:
-        cmd += ["--base", str(base)]
-    if faces:
-        cmd.append("--faces")
-    if clip:
-        cmd.append("--clip")
+def _vision_call(doc, extra, timeout=1800):
+    """One ml/vision.py subprocess. Returns the parsed result or {"status": "failed"}."""
+    cmd = [str(ML_PY), str(VISION_PY), "analyze", "-"] + extra
     try:
         p = subprocess.run(cmd, input=json.dumps(doc, default=str), capture_output=True,
-                           text=True, timeout=1800)
+                           text=True, timeout=timeout)
     except Exception as e:
         return {"status": "failed", "reason": type(e).__name__}
     try:
@@ -1708,7 +1723,44 @@ def stage_vision(findings, accounts, faces=False, clip=False, threshold=0.5, bas
     if res.get("error"):
         return {"status": "failed", "reason": res["error"][:300]}
     res["status"] = "ran"
-    res["flags"] = {"faces": faces, "clip": clip}
+    return res
+
+def stage_vision(findings, accounts, faces=False, deepface=False, clip=False, threshold=0.5, base=None):
+    """Local face / CLIP analysis over the captured pictures (ml/vision.py in its own venv).
+
+    Stages: hash (already done by the caller) -> InsightFace -> DeepFace confirmer -> CLIP.
+    `accounts` is the exact list vision.py indexes as acct:<i>, so merge_vision must get
+    the same list. Nothing leaves the machine; the models are read from ml/models."""
+    if not (faces or clip):
+        return {"status": "skipped", "reason": "not requested (--faces / --clip)"}
+    if not ML_PY.exists():
+        return {"status": "skipped", "reason": "local vision stack missing (dashboard/install-ml.sh)"}
+    if faces and not (OSINT / "ml" / "models" / "models" / "buffalo_l").is_dir():
+        return {"status": "skipped", "reason": "face model not downloaded yet (ml/.venv/bin/python ml/vision.py warmup)"}
+    if deepface and not DEEPFACE_WEIGHTS.is_dir():
+        deepface = False
+        findings["deepface_note"] = "DeepFace weights missing: run ml/.venv/bin/python ml/vision.py warmup"
+    doc = {"target_images": findings.get("target_images") or [], "accounts": accounts,
+           "metadata": findings.get("metadata") or []}
+    base_args = ["--threshold", str(threshold)] + (["--base", str(base)] if base else [])
+
+    # TensorFlow (DeepFace) and torch (CLIP) abort the process when both load beside
+    # onnxruntime, so CLIP gets its own subprocess whenever DeepFace runs.
+    split = deepface and clip
+    first = base_args + (["--faces"] if faces else []) + (["--deepface"] if deepface else []) \
+        + ([] if split else (["--clip"] if clip else []))
+    res = _vision_call(doc, first)
+    if res.get("status") == "failed":
+        return res
+    if split:
+        cres = _vision_call(doc, base_args + ["--clip"])
+        if cres.get("status") == "failed":
+            res["clip_error"] = cres.get("reason")
+        else:
+            res["clip_similar"] = cres.get("clip_similar") or []
+            res.setdefault("ran", {})["clip"] = True
+            res.setdefault("engine", {})["clip"] = (cres.get("engine") or {}).get("clip")
+    res["flags"] = {"faces": faces, "deepface": deepface, "clip": clip}
     return res
 
 def _add_match(ti, acc, tier, kind, score):
@@ -1762,6 +1814,60 @@ def merge_vision(findings, res, accounts):
         ti, acc = _target(m["a"]), _acct(m["b"])
         if ti is not None and acc is not None:
             _add_match(ti, acc, "similar", "clip", m["score"])
+
+    # DeepFace is a confirmer: it annotates InsightFace's pairs, it never adds one.
+    # Verdicts are kept per picture, not per account: acct:<i> and cover:<i> are the same row
+    # but different photographs, and a refused banner must not condemn the profile picture.
+    # A picture is stamped only when DeepFace vouched for it in NO pair, so a photo confirmed
+    # against the reference keeps its face even if some other pairing was refused.
+    seen, disputed_edges = {}, []
+    for c in res.get("deepface_confirms") or []:
+        st = c.get("status")
+        if st == "disputed":
+            disputed_edges.append(c)
+        for ka, kb in ((c["a"], c["b"]), (c["b"], c["a"])):
+            acc = _acct(ka)
+            if acc is None:
+                continue
+            kind = ka.partition(":")[0]
+            seen.setdefault((id(acc), kind), set()).add(st)
+            if kind != "acct":
+                continue        # a cover verdict says nothing about the avatar shown in a match row
+            ti = _target(kb)
+            if ti is not None:
+                for m in ti.get("matches") or []:
+                    if m.get("url") == acc.get("url"):
+                        m["deepface_status"] = st
+                        m["deepface_models"] = c.get("models") or []
+    _fold = lambda st: ("confirmed" if "confirmed" in st
+                        else "disputed" if "disputed" in st else "abstained")
+    for acc in accounts:
+        if seen.get((id(acc), "acct")):
+            acc["deepface_status"] = _fold(seen[(id(acc), "acct")])
+        if seen.get((id(acc), "cover")):
+            acc["cover_deepface_status"] = _fold(seen[(id(acc), "cover")])
+    # deepface_marked means the stamp really went into the pixels; the dashboard draws its own
+    # banner only when it did not, so an unreadable picture is still flagged somewhere.
+    # The clean copy is kept because ml/vision.py reads these fields back on the next run and
+    # must never re-grade a stamped picture.
+    for acc in accounts:
+        if acc.get("deepface_status") == "disputed" and acc.get("avatar") and not acc.get("deepface_marked"):
+            marked = _watermark(acc["avatar"])
+            if marked != acc["avatar"]:
+                acc["avatar_plain"] = acc["avatar"]
+                acc["avatar"], acc["deepface_marked"] = marked, True
+        if acc.get("cover_deepface_status") == "disputed" and acc.get("cover_thumb") and not acc.get("cover_marked"):
+            marked = _watermark(acc["cover_thumb"])
+            if marked != acc["cover_thumb"]:
+                acc["cover_thumb_plain"] = acc["cover_thumb"]
+                acc["cover_thumb"], acc["cover_marked"] = marked, True
+    for ti in tis:
+        for m in ti.get("matches") or []:
+            if m.get("deepface_status") == "disputed" and m.get("avatar") and not m.get("deepface_marked"):
+                marked = _watermark(m["avatar"])
+                if marked != m["avatar"]:
+                    m["avatar"], m["deepface_marked"] = marked, True
+
     for ti in tis:
         (ti.get("matches") or []).sort(key=lambda m: (MATCH_TIER_ORDER.get(m.get("tier"), 9), -(m.get("score") or 0)))
 
@@ -1782,9 +1888,13 @@ def merge_vision(findings, res, accounts):
                        "max_score": max(scores) if scores else None})
     groups.sort(key=lambda g: -(g["max_score"] or 0))
     for i, g in enumerate(groups, 1):
+        urls = {x["url"] for x in g["members"]}
         for acc in accounts:
-            if any(acc.get("url") == x["url"] for x in g["members"]):
+            if acc.get("url") in urls:
                 acc["face_group"] = i
+        g["deepface_disputed"] = sum(
+            1 for c in disputed_edges
+            if {(_acct(c["a"]) or {}).get("url"), (_acct(c["b"]) or {}).get("url")} <= urls)
     findings["face_groups"] = groups
 
 _SCRIPT_RE = re.compile(r"<(script|style|template|noscript)\b[^>]*>.*?</\1>", re.I | re.S)
@@ -2161,6 +2271,9 @@ def main():
     ap.add_argument("--faces", action="store_true",
                     help="compare faces across the captured pictures with the local InsightFace model "
                          "(biometric processing: opt-in, needs dashboard/install-ml.sh)")
+    ap.add_argument("--deepface", action="store_true",
+                    help="re-check every InsightFace match with DeepFace (Facenet512 + VGG-Face); a match "
+                         "DeepFace refuses is marked disputed and its picture is stamped")
     ap.add_argument("--clip", action="store_true",
                     help="CLIP visual similarity between reference images and captured pictures (local)")
     ap.add_argument("--face-threshold", type=float, default=0.5,
@@ -2501,9 +2614,10 @@ def main():
     if target_imgs and ver_accs:
         match_target_images_against_accounts(target_imgs, ver_accs)
     if args.faces or args.clip:
-        step("[VISUAL] local vision stage (faces / CLIP) ...")
-    vis = stage_vision(findings, ver_accs, faces=args.faces, clip=args.clip,
-                       threshold=args.face_threshold, base=tpath.parent)
+        stages = ["InsightFace"] * bool(args.faces) + ["DeepFace"] * bool(args.deepface) + ["CLIP"] * bool(args.clip)
+        step(f"[VISUAL] local vision stage ({' -> '.join(stages)}) ...")
+    vis = stage_vision(findings, ver_accs, faces=args.faces or args.deepface, deepface=args.deepface,
+                       clip=args.clip, threshold=args.face_threshold, base=tpath.parent)
     findings["vision"] = vis
     merge_vision(findings, vis, ver_accs)
 
@@ -2533,19 +2647,35 @@ def main():
     else:
         log("  no shared profile picture among the scanned accounts")
 
-    print(_c("1;36", "─── 3. LOCAL VISION (InsightFace / CLIP) ───"))
+    print(_c("1;36", "─── 3. LOCAL VISION (hash -> InsightFace -> DeepFace -> CLIP) ───"))
     if vis.get("status") == "ran":
         ran = vis.get("ran") or {}
         if ran.get("faces"):
-            ok(f"faces: {vis.get('faces_total', 0)} face(s) in {len(vis.get('images') or [])} picture(s), "
+            ok(f"InsightFace: {vis.get('faces_total', 0)} face(s) in {len(vis.get('images') or [])} picture(s), "
                f"{len(vis.get('face_matches') or [])} cross-account pair(s) >= {vis.get('threshold')}")
             for i, g in enumerate(findings.get("face_groups") or [], 1):
                 ok(f"same face #{i} (cosine {g['min_score']:.2f}-{g['max_score']:.2f}): "
                    + ", ".join(m.get("site") or "?" for m in g["members"]))
+        if ran.get("deepface"):
+            conf = vis.get("deepface_confirms") or []
+            tally = {k: sum(1 for c in conf if c.get("status") == k) for k in ("confirmed", "disputed", "abstained")}
+            ok(f"DeepFace (confirmer): {tally['confirmed']} confirmed, {tally['disputed']} disputed, "
+               f"{tally['abstained']} could not be judged")
+            for c in conf:
+                if c.get("status") != "disputed":
+                    continue
+                which = ", ".join(f"{r['model']} says no ({r['distance']} > {r['threshold']})"
+                                  for r in c.get("models") or [] if not r.get("verified"))
+                warn(f"disputed: {c.get('a_label')} <-> {c.get('b_label')} "
+                     f"(InsightFace {c.get('insightface_score')}) — {which}; picture stamped")
+        elif vis.get("deepface_error"):
+            warn(f"DeepFace: {vis['deepface_error']}")
         if ran.get("clip"):
             ok(f"CLIP: {len(vis.get('clip_similar') or [])} reference/captured pair(s) look alike")
     else:
         log(f"  {vis.get('status')}: {vis.get('reason')}")
+    if findings.get("deepface_note"):
+        warn(findings["deepface_note"])
     print()
 
     update_target(tpath, findings, ts)
@@ -2594,9 +2724,9 @@ def _seeds(findings):
     inp = findings.get("input") or {}
     names = sorted({v.get("display_name") for v in findings.get("verified") or []
                     if v.get("state") == "verified" and v.get("display_name")})
-    return {"names": list(inp.get("name") or []) + names,
+    return {"names": list(dict.fromkeys(list(inp.get("name") or []) + names)),
             "usernames": list(inp.get("username") or []),
-            "emails": list(inp.get("email") or []) + list(inp.get("_derived_emails") or []),
+            "emails": list(dict.fromkeys(list(inp.get("email") or []) + list(inp.get("_derived_emails") or []))),
             "phones": list(inp.get("phone") or []),
             "domains": list(inp.get("domain") or [])}
 
@@ -2709,7 +2839,8 @@ def update_target(tpath, findings, ts):
     for ti in (findings.get("target_images") or []):
         for m in ti.get("matches", []):
             sc = f" {m['score']:.2f}" if m.get("score") else ""
-            lines.append(f"matched_target_image: [{m.get('tier', 'possible')}{sc}] {m.get('site')} | {m.get('url')} | user={m.get('user')} (matched {ti.get('filename')})")
+            df = f" | deepface={m['deepface_status']}" if m.get("deepface_status") else ""
+            lines.append(f"matched_target_image: [{m.get('tier', 'possible')}{sc}] {m.get('site')} | {m.get('url')} | user={m.get('user')} (matched {ti.get('filename')}){df}")
     for i, g in enumerate(findings.get("face_groups") or [], 1):
         lines.append(f"same_face: #{i} | " + " | ".join(f"{x.get('site')} {x.get('url')}" for x in g["members"]))
     for e, r in findings["email"].items():
@@ -2922,6 +3053,17 @@ def write_html_report(findings, tpath, ts):
                             tag_cls, tag_txt = "warn", f"visually similar (CLIP {score:.2f})"
                         else:
                             tag_cls, tag_txt = "warn", "possible match (perceptual)"
+                        df = m.get("deepface_status")
+                        df_tag = ""
+                        if df == "confirmed":
+                            df_tag = " <span class='tag ok'>DeepFace confirms</span>"
+                        elif df == "disputed":
+                            which = ", ".join(r["model"] for r in (m.get("deepface_models") or [])
+                                              if not r.get("verified"))
+                            df_tag = (f" <span class='tag bad'>DeepFace does not confirm"
+                                      + (f" ({_e(which)})" if which else "") + "</span>")
+                        elif df == "abstained":
+                            df_tag = " <span class='tag'>DeepFace saw no face</span>"
                         av_html = (f"<img class='av' style='display:inline-block;vertical-align:middle;margin-right:6px;width:28px;height:28px' "
                                    f"src='{_img(m.get('avatar'))}' alt=''>" if m.get("avatar") else "")
                         site_link = f"<a href='{_href(m.get('url'))}' target='_blank' rel='noopener'><b>{_e(m.get('site'))}</b></a>"
@@ -2929,7 +3071,7 @@ def write_html_report(findings, tpath, ts):
                         name_str = f" ({_e(m.get('display_name'))})" if m.get("display_name") else ""
                         kind_str = f" [{_e(m.get('kind'))}]" if m.get("kind") == "cover" else ""
                         m_bits.append(f"<div style='margin-bottom:6px'>{av_html}{site_link}{user_str}{name_str}{kind_str} "
-                                      f"<span class='tag {tag_cls}'>{tag_txt}</span></div>")
+                                      f"<span class='tag {tag_cls}'>{tag_txt}</span>{df_tag}</div>")
                     a(f"<div>Matched Accounts <span class='tag ok'>{len(matches)} match(es)</span></div><div>{''.join(m_bits)}</div>")
                 else:
                     a("<div>Matched Accounts</div><div><span class='mut'>No direct photo match found in scanned profile avatars. "
@@ -2955,8 +3097,21 @@ def write_html_report(findings, tpath, ts):
         a("<div class='kv'>")
         if vis.get("status") == "ran":
             eng = " · ".join(f"{k}: {_e(v)}" for k, v in (vis.get("engine") or {}).items())
+            conf = vis.get("deepface_confirms") or []
+            df_line = ""
+            if (vis.get("ran") or {}).get("deepface"):
+                t = {k: sum(1 for c in conf if c.get("status") == k) for k in ("confirmed", "disputed", "abstained")}
+                df_line = (f"<br>DeepFace re-checked {len(conf)} InsightFace match(es): "
+                           f"<span class='tag ok'>{t['confirmed']} confirmed</span>"
+                           f"<span class='tag bad'>{t['disputed']} disputed</span>"
+                           f"<span class='tag'>{t['abstained']} not judged</span>"
+                           "<br><span class='mut'>A disputed picture is stamped "
+                           f"<code>{_e(DISPUTED_MARK)}</code>. DeepFace can only agree or refuse, "
+                           "it never adds a match of its own.</span>")
+            elif vis.get("deepface_error"):
+                df_line = f"<br><span class='mut'>DeepFace did not run: {_e(vis['deepface_error'])}</span>"
             a(f"<div>Local vision</div><div>{vis.get('faces_total', 0)} face(s) found in "
-              f"{len(vis.get('images') or [])} picture(s), face threshold {_e(vis.get('threshold'))}"
+              f"{len(vis.get('images') or [])} picture(s), face threshold {_e(vis.get('threshold'))}{df_line}"
               f"<br><span class='mut'>{eng}. Runs on this machine only; cosine similarity is not identity — "
               "biometric processing needs a lawful basis (KVKK art. 6 / GDPR art. 9).</span></div>")
         else:
@@ -2993,7 +3148,9 @@ def write_html_report(findings, tpath, ts):
             sites = ", ".join(f"<a href='{_href(x.get('url'))}' target='_blank' rel='noopener'>{_e(x.get('site'))}</a>"
                               for x in g["members"])
             lo, hi = f"{g.get('min_score') or 0:.2f}", f"{g.get('max_score') or 0:.2f}"
-            a(f"<div>Same face #{i} <span class='tag {'ok' if strong else 'warn'}'>cosine {lo}–{hi}</span></div>"
+            dq = (f" <span class='tag bad'>DeepFace refused {g['deepface_disputed']} link(s)</span>"
+                  if g.get("deepface_disputed") else "")
+            a(f"<div>Same face #{i} <span class='tag {'ok' if strong else 'warn'}'>cosine {lo}–{hi}</span>{dq}</div>"
               f"<div>{pics}<b>{len(g['members'])} accounts</b> show the same face — {sites} "
               "<span class='mut'>(local InsightFace embedding; a high score means the faces look alike, "
               "which is strong but not conclusive same-person evidence)</span></div>")
@@ -3084,6 +3241,13 @@ def write_html_report(findings, tpath, ts):
                 cell += f" <span class='tag ok'>face #{r['face_group']}</span>"
             if r.get("face_match"):
                 cell += f" <span class='tag {'ok' if r['face_match'] >= FACE_STRONG else 'warn'}'>ref face {r['face_match']:.2f}</span>"
+            dfs = r.get("deepface_status")
+            if dfs == "disputed":
+                cell += "<span class='tag bad' title='DeepFace re-checked this match and refused it'>DeepFace disputed</span>"
+            elif dfs == "confirmed":
+                cell += "<span class='tag ok'>DeepFace confirmed</span>"
+            elif dfs == "abstained":
+                cell += "<span class='tag' title='DeepFace found no face to judge'>DeepFace n/a</span>"
             arc = r.get("archive") or {}
             if arc.get("existed"):
                 cell += (f" <a href='{_href(arc.get('wayback_url'))}' target='_blank' rel='noopener'>"

@@ -15,6 +15,12 @@ if ! "$VENV/bin/python" -c "import torch" 2>/dev/null; then
 fi
 uv pip install --python "$VENV/bin/python" \
   numpy pillow onnxruntime insightface opencv-python-headless open_clip_torch telethon
-echo "downloading the models into $OSINT/ml/models ..."
+# Optional DeepFace confirmer: pulls TensorFlow (~2 GB) and keeps its weights in ~/.deepface.
+# KARGU_SKIP_DEEPFACE=1 leaves it out; --faces and --clip work without it.
+if [ "${KARGU_SKIP_DEEPFACE:-0}" != "1" ]; then
+  uv pip install --python "$VENV/bin/python" deepface tf-keras retina-face
+fi
+echo "downloading the models ..."
 "$VENV/bin/python" "$OSINT/ml/vision.py" warmup
-echo "Done. Face matching (--faces), CLIP (--clip) and Telegram search are now available."
+echo "Done. InsightFace (--faces), the DeepFace confirmer (--deepface), CLIP (--clip)"
+echo "and Telegram search are now available."

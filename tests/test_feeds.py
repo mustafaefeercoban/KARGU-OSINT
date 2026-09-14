@@ -88,6 +88,39 @@ class Sentinel(unittest.TestCase):
         self.assertEqual(r["items"], [])
 
 
+class VisionConfirmerContract(unittest.TestCase):
+    """ml/vision.py's confirmer wiring, without loading the ML libraries."""
+
+    def _vision(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("vision", ROOT / "ml" / "vision.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_deepface_without_the_insightface_stage_is_refused(self):
+        V = self._vision()
+        r = V.analyze({"accounts": [], "target_images": [], "metadata": []},
+                      faces=False, deepface=True, clip=False)
+        self.assertEqual(r["note"], "no pictures in this case")
+
+    def test_deepface_home_follows_the_environment(self):
+        import os, pathlib as pl
+        V = self._vision()
+        old = os.environ.get("DEEPFACE_HOME")
+        try:
+            os.environ["DEEPFACE_HOME"] = "/tmp/dfhome-test"
+            self.assertEqual(V.deepface_home(), pl.Path("/tmp/dfhome-test/.deepface/weights"))
+        finally:
+            os.environ.pop("DEEPFACE_HOME", None)
+            if old is not None: os.environ["DEEPFACE_HOME"] = old
+
+    def test_stdout_logging_is_silenced_before_deepface_is_imported(self):
+        self._vision()
+        import os
+        self.assertEqual(os.environ.get("DEEPFACE_LOG_LEVEL"), "50")
+
+
 class WizardImageField(unittest.TestCase):
 
     def test_image_validator_and_profile_text(self):

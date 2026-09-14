@@ -306,8 +306,9 @@ def api_run():
     if not request.form.get("api"):    cmd.append("--no-api")
     if request.form.get("tor"):        cmd.append("--tor")
     if request.form.get("deep"):       cmd.append("--deep")
-    if request.form.get("faces") and ML_PY.exists(): cmd.append("--faces")
-    if request.form.get("clip") and ML_PY.exists():  cmd.append("--clip")
+    if request.form.get("faces") and ML_PY.exists():    cmd.append("--faces")
+    if request.form.get("deepface") and ML_PY.exists(): cmd.append("--deepface")
+    if request.form.get("clip") and ML_PY.exists():     cmd.append("--clip")
     jid = uuid.uuid4().hex[:10]
     JOBS[jid] = {"log": [f"$ {' '.join(cmd)}"], "status": "running", "case": folder.name, "export": False}
     threading.Thread(target=_worker, args=(jid, cmd, folder), daemon=True).start()
@@ -437,19 +438,33 @@ def _vision(name, args, timeout=1800):
 @app.post("/api/vision/<name>")
 def api_vision(name):
     faces = request.args.get("faces") == "1"
+    deepface_flag = request.args.get("deepface") == "1"
     clip = request.args.get("clip") == "1"
-    if not (faces or clip):
-        return jsonify(error="nothing requested: faces=1 and/or clip=1")
+    if not (faces or deepface_flag or clip):
+        return jsonify(error="nothing requested: faces=1 and/or deepface=1 and/or clip=1")
     try:
         thr = float(request.args.get("threshold") or 0.5)
     except ValueError:
         thr = 0.5
-    args = ["analyze", None, "--threshold", str(thr)] + (["--faces"] if faces else []) + (["--clip"] if clip else [])
     j = _find_case(name)
     if not j:
         return jsonify(error="case not found")
-    args[1] = str(j)
-    res, j = _vision(name, args)
+    base = ["analyze", str(j), "--threshold", str(thr)]
+    # TensorFlow (DeepFace) and torch (CLIP) abort the process when both load beside
+    # onnxruntime, so CLIP gets its own subprocess whenever DeepFace runs.
+    split = deepface_flag and clip
+    first = base + (["--faces"] if faces or deepface_flag else []) \
+        + (["--deepface"] if deepface_flag else []) \
+        + ([] if split else (["--clip"] if clip else []))
+    res, j = _vision(name, first)
+    if split and not res.get("error"):
+        cres, _ = _vision(name, base + ["--clip"])
+        if cres.get("error"):
+            res["clip_error"] = cres["error"]
+        else:
+            res["clip_similar"] = cres.get("clip_similar") or []
+            res.setdefault("ran", {})["clip"] = True
+            res.setdefault("engine", {})["clip"] = (cres.get("engine") or {}).get("clip")
     if not res.get("error"):
         res["status"], res["source"] = "ran", "dashboard"
         res["when"] = datetime.datetime.now().isoformat(timespec="seconds")
@@ -462,7 +477,7 @@ def api_vision(name):
 
 @app.post("/api/faces/<name>")
 def api_faces(name):
-    return redirect(f"/api/vision/{name}?faces=1", code=307)
+    return redirect(f"/api/vision/{name}?faces=1&deepface=1", code=307)
 
 
 @app.post("/api/clip/<name>")

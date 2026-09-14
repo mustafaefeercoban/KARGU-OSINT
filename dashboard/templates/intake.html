@@ -93,6 +93,7 @@
             <label class="opt"><input type="checkbox" name="tor"> route via Tor</label>
             {% if ml %}
             <label class="opt wide"><input type="checkbox" name="faces"> local face matching (InsightFace) — biometric processing, needs a lawful basis</label>
+            <label class="opt wide"><input type="checkbox" name="deepface"> DeepFace re-check — stamps any match it cannot confirm (slower)</label>
             <label class="opt wide"><input type="checkbox" name="clip"> CLIP visual similarity for reference photos</label>
             {% else %}
             <div class="opt wide mut">Face matching / CLIP are off: run <code>dashboard/install-ml.sh</code></div>

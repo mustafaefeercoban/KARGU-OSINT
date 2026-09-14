@@ -6,6 +6,8 @@ const CASE = window.__CASE__ || "";
 const FOLDER = window.__FOLDER__ || CASE;
 const FACE_STRONG = 0.65;
 let DATA = null;
+let DFSTATUS = {};
+let DISPUTED = new Set();
 
 async function boot() {
   if (window.__DATA__) { DATA = window.__DATA__; }
@@ -13,6 +15,7 @@ async function boot() {
     try { DATA = await (await fetch(`/api/case/${encodeURIComponent(FOLDER)}`)).json(); }
     catch (e) { document.body.innerHTML = "<p style='padding:20px'>case data could not be loaded.</p>"; return; }
   }
+  refreshDeepFace();
   for (const fn of [renderIdentity, renderMap, renderVisual, renderContext]) {
     try { fn(); } catch (e) { console.error(fn.name, e); }
   }
@@ -45,6 +48,9 @@ function renderIdentity() {
     if (a.photo_group) tags.push(`<span class='tag ${a.photo_tier === "strong" ? "ok" : "warn"}'>photo #${a.photo_group}</span>`);
     if (a.face_group) tags.push(`<span class='tag ok'>face #${a.face_group}</span>`);
     if (a.face_match) tags.push(`<span class='tag ${a.face_match >= FACE_STRONG ? "ok" : "warn"}'>ref face ${a.face_match.toFixed(2)}</span>`);
+    const dfs = DFSTATUS[a.url] || a.deepface_status;
+    if (dfs) tags.push(dfTag(dfs, a.deepface_models));
+    if (dfs === "disputed") row.classList.add("disputed");
     row.innerHTML =
       (a.avatar ? `<img src="${esc(a.avatar)}" alt="">` : `<div class='noav'></div>`) +
       `<div><div class='nm'><a href="${esc(a.url)}" target="_blank" rel="noopener">${esc(a.display_name || a.site)}</a></div>` +
@@ -159,6 +165,48 @@ async function runTelegram(q = $("#tq").value.trim()) {
 }
 
 // ---- RIGHT: visual ----
+// DeepFace verdicts reach us two ways: baked into the export by a --deepface scan, or as
+// deepface_confirms in a sidecar a dashboard run wrote. The sidecar is the fresher of the two.
+// Same rule as the scanner: one confirmation anywhere clears a picture, so a photo matched to
+// the reference is not marked because some other pairing was refused.
+function dfStatusByUrl() {
+  const v = DATA.vision || {};
+  const confirms = v.deepface_confirms || [];
+  const out = {};
+  if (confirms.length) {
+    // acct:<i> and cover:<i> share a url but are different photographs, so a cover verdict
+    // must not decide the avatar's status. Only avatar verdicts are folded here.
+    const byKey = {};
+    (v.images || []).forEach(i => { if (i.url && /^acct:/.test(i.key)) byKey[i.key] = i.url; });
+    const seen = {};
+    confirms.forEach(c => [c.a, c.b].forEach(k => {
+      const u = byKey[k];
+      if (u) (seen[u] || (seen[u] = new Set())).add(c.status);
+    }));
+    Object.entries(seen).forEach(([u, st]) => {
+      out[u] = st.has("confirmed") ? "confirmed" : st.has("disputed") ? "disputed" : "abstained";
+    });
+  } else {
+    (DATA.accounts || []).forEach(a => { if (a.url && a.deepface_status) out[a.url] = a.deepface_status; });
+  }
+  return out;
+}
+// A picture the scan already stamped carries the mark inside the JPEG; do not band it twice.
+function needsBand(url) {
+  const a = (DATA.accounts || []).find(x => x.url === url);
+  return !(a && a.deepface_marked);
+}
+function refreshDeepFace() {
+  DFSTATUS = dfStatusByUrl();
+  DISPUTED = new Set(Object.entries(DFSTATUS).filter(([, v]) => v === "disputed").map(([u]) => u));
+}
+function dfTag(status, models) {
+  if (status === "confirmed") return `<span class='df ok'>DeepFace confirms</span>`;
+  if (status === "abstained") return `<span class='df na'>DeepFace saw no face</span>`;
+  if (status !== "disputed") return "";
+  const which = (models || []).filter(r => !r.verified).map(r => r.model).join(", ");
+  return `<span class='df'>DeepFace does not confirm${which ? " (" + esc(which) + ")" : ""}</span>`;
+}
 function tierTag(m) {
   const t = m.tier, s = m.score || 0;
   if (t === "strong") return "<span class='tag ok'>byte-identical</span>";
@@ -188,7 +236,7 @@ function renderVisual() {
       (ti.error ? `<div class="tag bad">${esc(ti.error)}</div>` : "") + `</div></div>`;
     if (matches.length) {
       body += `<div style="margin-top:8px;padding-top:8px;border-top:1px dashed var(--line)"><div class="mut" style="font-size:11px;margin-bottom:4px">matched accounts (${matches.length})</div>` +
-        matches.map(m => `<div class="m">${tierTag(m)}${avatarFor(m.url)}<a href="${esc(m.url || "#")}" target="_blank" rel="noopener">${esc(m.site || "?")}</a><span class="mut mono">@${esc(m.user || "")}</span>` +
+        matches.map(m => `<div class="m">${avatarFor(m.url)}<a href="${esc(m.url || "#")}" target="_blank" rel="noopener">${esc(m.site || "?")}</a><span class="mut mono">@${esc(m.user || "")}</span>${tierTag(m)}${dfTag(m.deepface_status || "", m.deepface_models)}` +
           (m.face_score && m.kind !== "face" ? `<span class="mut">face ${m.face_score.toFixed(2)}</span>` : "") +
           (m.clip_score && m.kind !== "clip" ? `<span class="mut">CLIP ${m.clip_score.toFixed(2)}</span>` : "") + `</div>`).join("") + `</div>`;
     } else if (!ti.error) {
@@ -221,7 +269,7 @@ function renderVisual() {
   }
   b.appendChild(el("h3", null, `Profile pictures (${withPic.length})`));
   const pics = el("div", "pics");
-  withPic.forEach(a => pics.appendChild(el("div", "pic",
+  withPic.forEach(a => pics.appendChild(el("div", "pic" + (DISPUTED.has(a.url) && needsBand(a.url) ? " disputed" : ""),
     `<a href="${esc(a.url || '#')}" target="_blank" rel="noopener"><img src="${esc(a.avatar)}" title="${esc(a.site)} · ${esc(a.user || '')}"></a>` +
     `<div class='cap'>${esc(a.site)}</div>`)));
   b.appendChild(pics);
@@ -245,7 +293,7 @@ function renderVisual() {
   b.appendChild(el("div", "vis-head", `<h3>3 · Local vision</h3><span class="tag info">InsightFace · CLIP</span>`));
   const vout = el("div"); b.appendChild(vout);
   renderVision(vout);
-  const ctl = el("div", "q", `<button id="facebtn">Run face matching${refs.length ? " + CLIP" : ""}</button>`);
+  const ctl = el("div", "q", `<button id="facebtn">Run face matching + DeepFace check${refs.length ? " + CLIP" : ""}</button>`);
   b.appendChild(ctl);
   $("#facebtn").addEventListener("click", () => runVision(vout, refs.length > 0));
   const clipq = el("div", "q", `<input id="clipq" placeholder="describe what to look for: 'uniform', 'tattoo', 'glasses'…"><button id="clipbtn">CLIP search</button>`);
@@ -302,16 +350,34 @@ function renderVision(out) {
       `<span class='tag warn'>${(m.score * 100).toFixed(0)} %</span><div>${esc(m.a_label)} ↔ ${esc(m.b_label)}</div>`)));
   }
   if (!groups.length && !refPairs.length) out.appendChild(el("div", "mut", "No cross-account face match above the threshold."));
+  const conf = v.deepface_confirms || [];
+  if ((v.ran || {}).deepface) {
+    const t = { confirmed: 0, disputed: 0, abstained: 0 };
+    conf.forEach(c => { if (c.status in t) t[c.status]++; });
+    out.appendChild(el("h3", null, "DeepFace second opinion"));
+    out.appendChild(el("div", null,
+      `<span class='df ok'>${t.confirmed} confirmed</span><span class='df'>${t.disputed} disputed</span><span class='df na'>${t.abstained} not judged</span>`));
+    conf.forEach(c => out.appendChild(el("div", "pair",
+      `<span class='df${c.status === "confirmed" ? " ok" : c.status === "abstained" ? " na" : ""}'>${esc(c.status)}</span>` +
+      `<div>${esc(c.a_label)} ↔ ${esc(c.b_label)} <span class='mut'>InsightFace ${c.insightface_score ?? "?"}</span>` +
+      (c.models || []).map(r => `<div class='m mut' style='font-size:11px'>${esc(r.model)}: ${r.verified ? "agrees" : "refuses"} (${r.distance} vs ${r.threshold})</div>`).join("") +
+      `</div>`)));
+    out.appendChild(el("div", "note", "DeepFace only re-checks what InsightFace matched; it cannot add a match of its own. A disputed picture is marked so it is not read as evidence."));
+  } else if (v.deepface_error) {
+    out.appendChild(el("div", "note", "DeepFace did not run: " + esc(v.deepface_error)));
+  }
   out.appendChild(el("div", "note", "Cosine similarity, not identity: a high score means the faces look alike. Biometric processing is special-category data (KVKK art. 6 / GDPR art. 9)."));
 }
 async function runVision(out, withClip) {
   if (!confirm("Face matching processes biometric data locally. Continue only if you have a lawful basis for this target.")) return;
-  out.innerHTML = "<div class='mut'>embedding faces on the local CPU (10–60 s)…</div>";
+  out.innerHTML = "<div class='mut'>InsightFace embeddings, then the DeepFace re-check on whatever matched (about 30 s to a few minutes)…</div>";
   try {
-    const r = await (await fetch(`/api/vision/${encodeURIComponent(FOLDER)}?faces=1${withClip ? "&clip=1" : ""}`, { method: "POST" })).json();
+    const r = await (await fetch(`/api/vision/${encodeURIComponent(FOLDER)}?faces=1&deepface=1${withClip ? "&clip=1" : ""}`, { method: "POST" })).json();
     if (r.error) { out.innerHTML = `<div class='note'>${esc(r.error)}</div>`; return; }
     DATA.vision = r;
+    refreshDeepFace();
     renderVision(out);
+    try { renderIdentity(); } catch (e) { console.error(e); }
   } catch (e) { out.innerHTML = "<div class='note'>Vision service unavailable.</div>"; }
 }
 async function runClip(q, out) {

@@ -123,6 +123,7 @@ def index():
              "<label><input type='checkbox' name='tor'> route via Tor</label>"
              "<label><input type='checkbox' name='deep'> SpiderFoot deep scan</label>"
              + ("<label><input type='checkbox' name='faces'> local face matching (biometric — lawful basis required)</label>"
+                "<label><input type='checkbox' name='deepface'> DeepFace re-check (stamps what it cannot confirm)</label>"
                 "<label><input type='checkbox' name='clip'> CLIP similarity for reference photos</label>"
                 if ML_PY.exists() else "")
              + "</div><button type='submit'>Start scan</button></form>")
@@ -190,8 +191,9 @@ def start_run():
     if not request.form.get("api"):    cmd.append("--no-api")
     if request.form.get("tor"):        cmd.append("--tor")
     if request.form.get("deep"):       cmd.append("--deep")
-    if request.form.get("faces") and ML_PY.exists(): cmd.append("--faces")
-    if request.form.get("clip") and ML_PY.exists():  cmd.append("--clip")
+    if request.form.get("faces") and ML_PY.exists():    cmd.append("--faces")
+    if request.form.get("deepface") and ML_PY.exists(): cmd.append("--deepface")
+    if request.form.get("clip") and ML_PY.exists():     cmd.append("--clip")
 
     jid = uuid.uuid4().hex[:10]
     JOBS[jid] = {"log": [f"$ {' '.join(cmd)}"], "status": "running", "case": folder.name, "report": None}
